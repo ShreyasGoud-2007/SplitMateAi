@@ -4,7 +4,7 @@ import ScanBillCard from '@/components/ScanBillCard';
 import { Colors } from '@/constants/Colors';
 import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
-import { Bell, Sparkles, User } from 'lucide-react-native';
+import { Bell, Sparkles, User, UsersRound } from 'lucide-react-native';
 import {
   ScrollView,
   StyleSheet,
@@ -86,6 +86,23 @@ export default function HomeScreen() {
             <Text style={styles.chipText}>👥 Multi-person</Text>
           </View>
         </View>
+
+        <TouchableOpacity
+          style={styles.startSplitButton}
+          onPress={() => router.push('/split/new')}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          accessibilityLabel="Start a group split"
+        >
+          <View style={styles.startSplitIcon}>
+            <UsersRound size={20} color={Colors.primary} strokeWidth={2} />
+          </View>
+          <View style={styles.startSplitCopy}>
+            <Text style={styles.startSplitTitle}>Start a group split</Text>
+            <Text style={styles.startSplitSubtitle}>Add friends and set up your bill</Text>
+          </View>
+          <Text style={styles.startSplitArrow}>›</Text>
+        </TouchableOpacity>
 
         {/* Cards */}
         <ScanBillCard onPress={handleScanBill} />
@@ -207,4 +224,27 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: Colors.primary,
   },
+  startSplitButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 14,
+    marginBottom: 16,
+    borderRadius: 16,
+    backgroundColor: Colors.white,
+    borderWidth: 1,
+    borderColor: Colors.primary,
+  },
+  startSplitIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Colors.primaryLight,
+  },
+  startSplitCopy: { flex: 1, gap: 3 },
+  startSplitTitle: { color: Colors.textPrimary, fontSize: 14, fontWeight: '800' },
+  startSplitSubtitle: { color: Colors.textSecondary, fontSize: 12 },
+  startSplitArrow: { color: Colors.primary, fontSize: 28, lineHeight: 30, fontWeight: '400' },
 });

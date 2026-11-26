@@ -1,4 +1,5 @@
 import { Colors } from '@/constants/Colors';
+import { useAuth } from '@/store/authStore';
 import { StatusBar } from 'expo-status-bar';
 import {
     Bell,
@@ -10,8 +11,10 @@ import {
     Sparkles,
     User,
 } from 'lucide-react-native';
-import React from 'react';
+import React, { useRef } from 'react';
 import {
+    ActivityIndicator,
+    Alert,
     Platform,
     ScrollView,
     StyleSheet,
@@ -43,6 +46,39 @@ function MenuRow({ icon, label, sublabel, onPress, danger }: MenuRowProps) {
 }
 
 export default function ProfileScreen() {
+  const { user, signOut } = useAuth();
+  const [signingOut, setSigningOut] = React.useState(false);
+  const signingOutRef = useRef(false);
+  const displayName =
+    typeof user?.user_metadata?.name === 'string' && user.user_metadata.name.trim()
+      ? user.user_metadata.name
+      : 'SplitMate member';
+
+  function confirmSignOut() {
+    Alert.alert('Sign out?', 'You can sign in again to access your saved bill splits.', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Sign out',
+        style: 'destructive',
+        onPress: async () => {
+          if (signingOutRef.current) return;
+          signingOutRef.current = true;
+          setSigningOut(true);
+          try {
+            await signOut();
+          } catch (error) {
+            signingOutRef.current = false;
+            setSigningOut(false);
+            Alert.alert(
+              'Could not sign out',
+              error instanceof Error ? error.message : 'Please try again.',
+            );
+          }
+        },
+      },
+    ]);
+  }
+
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <StatusBar style="dark" />
@@ -66,12 +102,8 @@ export default function ProfileScreen() {
               <User size={36} color={Colors.white} strokeWidth={1.8} />
             </View>
           </View>
-          <Text style={styles.userName}>Guest User</Text>
-          <Text style={styles.userEmail}>Set up your profile to get started</Text>
-
-          <TouchableOpacity style={styles.editBtn} activeOpacity={0.85}>
-            <Text style={styles.editBtnText}>Edit Profile</Text>
-          </TouchableOpacity>
+          <Text style={styles.userName}>{displayName}</Text>
+          <Text style={styles.userEmail}>{user?.email || 'Signed in'}</Text>
         </View>
 
         {/* Stats row */}
@@ -127,9 +159,12 @@ export default function ProfileScreen() {
         <View style={styles.menuCard}>
           <MenuRow
             icon={<LogOut size={18} color="#EF4444" strokeWidth={2} />}
-            label="Sign Out"
+            label={signingOut ? 'Signing out…' : 'Sign out'}
+            sublabel="End your current session"
             danger
+            onPress={confirmSignOut}
           />
+          {signingOut ? <ActivityIndicator style={styles.signOutSpinner} color={Colors.primary} /> : null}
         </View>
 
         <Text style={styles.versionText}>SplitMate AI v1.0.0</Text>
@@ -328,4 +363,5 @@ const styles = StyleSheet.create({
     color: Colors.textMuted,
     marginTop: 8,
   },
+  signOutSpinner: { paddingVertical: 12 },
 });

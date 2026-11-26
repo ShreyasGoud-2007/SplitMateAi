@@ -1,4 +1,5 @@
 import { BillStoreProvider } from '@/store/billStore';
+import { AuthProvider, useAuth } from '@/store/authStore';
 import { useFonts } from 'expo-font';
 import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
@@ -10,37 +11,32 @@ export {
 } from 'expo-router';
 
 export const unstable_settings = {
-  anchor: '(tabs)',
+  anchor: 'index',
 };
 
 SplashScreen.preventAutoHideAsync();
 
-export default function RootLayout() {
-  const [loaded, error] = useFonts({
-    SpaceMono: require('../assets/fonts/SpaceMono-Regular.ttf'),
-  });
-
+function AppNavigator({ fontsLoaded }: { fontsLoaded: boolean }) {
+  const { status } = useAuth();
   useEffect(() => {
-    if (error) throw error;
-  }, [error]);
-
-  useEffect(() => {
-    if (loaded) {
+    if (fontsLoaded && status !== 'loading') {
       SplashScreen.hideAsync();
     }
-  }, [loaded]);
+  }, [fontsLoaded, status]);
 
-  if (!loaded) {
-    return null;
-  }
+  const isAuthenticated = status === 'authenticated';
+  const isUnauthenticated = status === 'unauthenticated';
 
   return (
-    <BillStoreProvider>
-      <Stack screenOptions={{ headerShown: false }}>
-        {/* Main tab navigator */}
+    <Stack screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="index" />
+      <Stack.Screen name="auth/callback" />
+      <Stack.Protected guard={isUnauthenticated} redirectTo="/(tabs)">
+        <Stack.Screen name="auth/login" />
+        <Stack.Screen name="auth/signup" />
+      </Stack.Protected>
+      <Stack.Protected guard={isAuthenticated} redirectTo="/auth/login">
         <Stack.Screen name="(tabs)" />
-
-        {/* Bill scanning flow */}
         <Stack.Screen
           name="scan/index"
           options={{ animation: 'slide_from_bottom', gestureEnabled: true }}
@@ -53,10 +49,38 @@ export default function RootLayout() {
           name="scan/results"
           options={{ animation: 'slide_from_right', gestureEnabled: true }}
         />
-
-        {/* Modal */}
+        <Stack.Screen
+          name="split/new"
+          options={{ animation: 'slide_from_right', gestureEnabled: true }}
+        />
+        <Stack.Screen
+          name="split/assignment"
+          options={{ animation: 'slide_from_right', gestureEnabled: true }}
+        />
+        <Stack.Screen
+          name="split/summary"
+          options={{ animation: 'slide_from_right', gestureEnabled: true }}
+        />
         <Stack.Screen name="modal" options={{ presentation: 'modal' }} />
-      </Stack>
+      </Stack.Protected>
+    </Stack>
+  );
+}
+
+export default function RootLayout() {
+  const [fontsLoaded, error] = useFonts({
+    SpaceMono: require('../assets/fonts/SpaceMono-Regular.ttf'),
+  });
+
+  useEffect(() => {
+    if (error) throw error;
+  }, [error]);
+
+  return (
+    <BillStoreProvider>
+      <AuthProvider>
+        <AppNavigator fontsLoaded={fontsLoaded} />
+      </AuthProvider>
     </BillStoreProvider>
   );
 }

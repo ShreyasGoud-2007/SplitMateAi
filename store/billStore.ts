@@ -7,8 +7,12 @@
  * a shared mutable reference.
  */
 
-import { buildDemoBill, type BillValidationWarning, type ExtractedBill } from '@/types/bill';
+import { buildDemoBill, type BillImageMetadata, type ExtractedBill } from '@/types/bill';
+import type { ItemAssignments } from '@/types/itemAssignment';
+import type { SplitSession } from '@/types/splitSession';
 import type { OCRExtractResponse } from '@/utils/api';
+import { adaptOCRResponseToBill } from '@/utils/billAdapters';
+import { normalizeBill } from '@/utils/billNormalization';
 import React, { createContext, useCallback, useContext, useRef } from 'react';
 
 interface BillStoreContextValue {
@@ -16,6 +20,14 @@ interface BillStoreContextValue {
   setBill: (bill: ExtractedBill) => void;
   /** Get the active bill (called from results.tsx on mount). */
   getBill: () => ExtractedBill | null;
+  /** Store the active group bill-splitting session. */
+  setSplitSession: (session: SplitSession) => void;
+  /** Get the active group bill-splitting session. */
+  getSplitSession: () => SplitSession | null;
+  /** Store item assignments for the active bill. */
+  setItemAssignments: (assignments: ItemAssignments) => void;
+  /** Get item assignments for the active bill. */
+  getItemAssignments: () => ItemAssignments;
 }
 
 const BillStoreContext = createContext<BillStoreContextValue | null>(null);
@@ -23,16 +35,39 @@ const BillStoreContext = createContext<BillStoreContextValue | null>(null);
 export function BillStoreProvider({ children }: { children: React.ReactNode }) {
   // useRef so mutations don't cause re-renders of the provider tree
   const billRef = useRef<ExtractedBill | null>(null);
+  const splitSessionRef = useRef<SplitSession | null>(null);
+  const itemAssignmentsRef = useRef<ItemAssignments>({});
 
   const setBill = useCallback((bill: ExtractedBill) => {
-    billRef.current = bill;
+    const normalized = normalizeBill(bill);
+    if (billRef.current && billRef.current.id !== normalized.id) {
+      itemAssignmentsRef.current = {};
+    }
+    billRef.current = normalized;
   }, []);
 
   const getBill = useCallback(() => billRef.current, []);
+  const setSplitSession = useCallback((session: SplitSession) => {
+    splitSessionRef.current = session;
+  }, []);
+  const getSplitSession = useCallback(() => splitSessionRef.current, []);
+  const setItemAssignments = useCallback((assignments: ItemAssignments) => {
+    itemAssignmentsRef.current = assignments;
+  }, []);
+  const getItemAssignments = useCallback(() => itemAssignmentsRef.current, []);
 
   return React.createElement(
     BillStoreContext.Provider,
-    { value: { setBill, getBill } },
+    {
+      value: {
+        setBill,
+        getBill,
+        setSplitSession,
+        getSplitSession,
+        setItemAssignments,
+        getItemAssignments,
+      },
+    },
     children,
   );
 }
@@ -69,38 +104,8 @@ export function storeOCRResult(
   imageUri: string,
   ocr: OCRExtractResponse,
 ): ExtractedBill {
-  const bill: ExtractedBill = {
-    imageUri,
-    items: ocr.items.map((item) => ({
-      id: item.id,
-      name: item.name,
-      qty: item.qty,
-      unitPricePaise: item.unit_price_paise,
-      unitPrice: item.unit_price_paise / 100,
-      confidence: item.confidence,
-    })),
-    detectedSubtotalPaise: ocr.detected_subtotal_paise,
-    detectedSubtotal:
-      ocr.detected_subtotal_paise !== null
-        ? ocr.detected_subtotal_paise / 100
-        : null,
-    detectedCurrency: ocr.detected_currency || 'INR',
-    isDemoData: false,
-
-    // Real OCR fields
-    restaurantName: ocr.restaurant_name,
-    detectedGstPaise: ocr.detected_gst_paise,
-    detectedDiscountPaise: ocr.detected_discount_paise,
-    detectedServiceChargePaise: ocr.detected_service_charge_paise,
-    detectedGrandTotalPaise: ocr.detected_grand_total_paise,
-    computedSubtotalPaise: ocr.computed_subtotal_paise,
-    computedGrandTotalPaise: ocr.computed_grand_total_paise,
-    validationWarnings: ocr.validation_warnings as BillValidationWarning[] | undefined,
-    hasMismatch: ocr.has_mismatch,
-    overallConfidence: ocr.overall_confidence,
-    geminiWarnings: ocr.gemini_warnings,
-  };
-
+  const imageMetadata: BillImageMetadata = { uri: imageUri };
+  const bill = adaptOCRResponseToBill(ocr, imageMetadata);
   setBill(bill);
   return bill;
 }

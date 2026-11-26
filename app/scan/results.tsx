@@ -544,7 +544,7 @@ const row = StyleSheet.create({
 export default function ResultsScreen() {
   const router      = useRouter();
   const { uri }     = useLocalSearchParams<{ uri?: string }>();
-  const { getBill } = useBillStore();
+  const { getBill, setBill, getSplitSession, setItemAssignments } = useBillStore();
 
   /* Hydrate from store on first render */
   const storedBill         = getBill();
@@ -580,19 +580,25 @@ export default function ResultsScreen() {
 
   /* ── Item mutations ─────────────────────────────────────────────────── */
   const handleSaveItem = useCallback((updated: BillItem) => {
-    setItems(prev => {
-      const idx = prev.findIndex(i => i.id === updated.id);
-      if (idx === -1) return [...prev, updated];
-      const next = [...prev];
-      next[idx] = updated;
-      return next;
-    });
+    const currentItems = getBill()?.items ?? items;
+    const idx = currentItems.findIndex(i => i.id === updated.id);
+    const next = [...currentItems];
+    if (idx === -1) next.push(updated);
+    else next[idx] = updated;
+    setItems(next);
+    const currentBill = getBill();
+    if (currentBill) setBill({ ...currentBill, items: next });
+    setItemAssignments({});
     setEditTarget(null);
-  }, []);
+  }, [getBill, items, setBill, setItemAssignments]);
 
   const handleDelete = useCallback((id: string) => {
-    setItems(prev => prev.filter(i => i.id !== id));
-  }, []);
+    const next = (getBill()?.items ?? items).filter(i => i.id !== id);
+    setItems(next);
+    const currentBill = getBill();
+    if (currentBill) setBill({ ...currentBill, items: next });
+    setItemAssignments({});
+  }, [getBill, items, setBill, setItemAssignments]);
 
   const handleAdd = useCallback(() => {
     setEditTarget(makeBlankItem());
@@ -763,7 +769,11 @@ export default function ResultsScreen() {
         />
 
         {/* ── Split Bill CTA ── */}
-        <TouchableOpacity style={s.splitBtn} activeOpacity={0.88}>
+        <TouchableOpacity
+          style={s.splitBtn}
+          activeOpacity={0.88}
+          onPress={() => router.push(getSplitSession() ? '/split/assignment' : '/split/new')}
+        >
           <Users size={20} color={Colors.white} strokeWidth={2} />
           <Text style={s.splitBtnText}>Split Bill</Text>
           <ChevronRight size={18} color={Colors.white} strokeWidth={2.5} />

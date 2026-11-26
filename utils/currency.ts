@@ -11,6 +11,7 @@
 
 export const DEFAULT_CURRENCY = 'INR' as const;
 export const DEFAULT_LOCALE   = 'en-IN' as const;
+export const DEFAULT_TAX_RATE = 0.05;
 
 // ── Formatters (created once, reused) ────────────────────────────────────────
 
@@ -80,7 +81,7 @@ export function formatPaise(paise: number): string {
  * Uses integer arithmetic to avoid floating-point drift.
  */
 export function lineTotalPaise(unitPricePaise: number, qty: number): number {
-  return unitPricePaise * qty;           // both integers → result is exact
+  return Math.round(unitPricePaise * qty);
 }
 
 /**

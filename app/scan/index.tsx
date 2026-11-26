@@ -75,7 +75,6 @@ export default function ScanScreen() {
       });
 
       console.log('[Scan] Camera result canceled:', result.canceled);
-      setLoading(false);
 
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
@@ -87,14 +86,19 @@ export default function ScanScreen() {
         // Normalise content:// -> file:// so Image and FormData work on Android
         const fileUri = await normalizeImageUri(asset.uri, mime);
         console.log('[Scan] Normalised URI (first 80):', fileUri.slice(0, 80));
+        setLoading(false);
         navigateToReview(fileUri, mime, name);
       } else {
+        setLoading(false);
         console.log('[Scan] Camera picker cancelled or no assets');
       }
     } catch (err) {
       setLoading(false);
       console.error('[Scan] Camera handler error:', err instanceof Error ? err.message : String(err));
-      Alert.alert('Camera Error', 'Something went wrong while opening the camera. Please try again.');
+      Alert.alert(
+        'Camera Error',
+        err instanceof Error ? err.message : 'Something went wrong while opening the camera. Please try again.',
+      );
     }
   }
 
@@ -126,7 +130,6 @@ export default function ScanScreen() {
       });
 
       console.log('[Scan] Gallery result canceled:', result.canceled);
-      setLoading(false);
 
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
@@ -138,14 +141,19 @@ export default function ScanScreen() {
         // Normalise content:// -> file:// so Image and FormData work on Android
         const fileUri = await normalizeImageUri(asset.uri, mime);
         console.log('[Scan] Normalised URI (first 80):', fileUri.slice(0, 80));
+        setLoading(false);
         navigateToReview(fileUri, mime, name);
       } else {
+        setLoading(false);
         console.log('[Scan] Gallery picker cancelled or no assets');
       }
     } catch (err) {
       setLoading(false);
       console.error('[Scan] Gallery handler error:', err instanceof Error ? err.message : String(err));
-      Alert.alert('Gallery Error', 'Something went wrong while opening the gallery. Please try again.');
+      Alert.alert(
+        'Gallery Error',
+        err instanceof Error ? err.message : 'Something went wrong while opening the gallery. Please try again.',
+      );
     }
   }
 

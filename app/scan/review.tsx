@@ -1,7 +1,8 @@
 import LoadingOverlay from '@/components/LoadingOverlay';
 import { Colors } from '@/constants/Colors';
-import { storeOCRResult, useBillStore } from '@/store/billStore';
+import { storeDemoBill, storeOCRResult, useBillStore } from '@/store/billStore';
 import { extractBill, OCRError } from '@/utils/api';
+import { normalizeImageUri } from '@/utils/normalizeImageUri';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -65,7 +66,8 @@ export default function ReviewScreen() {
   const { setBill } = useBillStore();
   const [loading, setLoading]           = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
-  const [imageError, setImageError]     = useState(false);
+  const [imageErrorUri, setImageErrorUri] = useState<string | null>(null);
+  const imageError = imageErrorUri === uri;
 
   // ── Diagnostic logs — fires only on initial render (state flag trick) ──
   const [_loggedMount, _setLoggedMount] = useState(false);
@@ -119,22 +121,28 @@ export default function ReviewScreen() {
         allowsEditing: false,
       });
 
-      setLoading(false);
-
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
+        const selectedMimeType = asset.mimeType ?? 'image/jpeg';
+        const imageUri = await normalizeImageUri(asset.uri, selectedMimeType);
+        setLoading(false);
         router.replace({
           pathname: '/scan/review',
           params: {
-            uri:      asset.uri,
-            mimeType: asset.mimeType ?? 'image/jpeg',
+            uri:      imageUri,
+            mimeType: selectedMimeType,
             fileName: asset.fileName ?? 'bill.jpg',
           },
         });
+      } else {
+        setLoading(false);
       }
-    } catch {
+    } catch (err) {
       setLoading(false);
-      Alert.alert('Error', 'Failed to open the camera. Please try again.');
+      Alert.alert(
+        'Camera Error',
+        err instanceof Error ? err.message : 'Failed to open the camera. Please try again.',
+      );
     }
   }
 
@@ -161,22 +169,28 @@ export default function ReviewScreen() {
         selectionLimit: 1,
       });
 
-      setLoading(false);
-
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
+        const selectedMimeType = asset.mimeType ?? 'image/jpeg';
+        const imageUri = await normalizeImageUri(asset.uri, selectedMimeType);
+        setLoading(false);
         router.replace({
           pathname: '/scan/review',
           params: {
-            uri:      asset.uri,
-            mimeType: asset.mimeType ?? 'image/jpeg',
+            uri:      imageUri,
+            mimeType: selectedMimeType,
             fileName: asset.fileName ?? 'bill.jpg',
           },
         });
+      } else {
+        setLoading(false);
       }
-    } catch {
+    } catch (err) {
       setLoading(false);
-      Alert.alert('Error', 'Failed to open the gallery. Please try again.');
+      Alert.alert(
+        'Gallery Error',
+        err instanceof Error ? err.message : 'Failed to open the gallery. Please try again.',
+      );
     }
   }
 
@@ -203,6 +217,12 @@ export default function ReviewScreen() {
       console.log('[Review] restaurant_name:', result.restaurant_name ?? '(not detected)');
       console.log('[Review] has_mismatch:', result.has_mismatch);
       console.log('[Review] gemini_warnings:', result.gemini_warnings);
+
+      if (result.items.length === 0) {
+        showDefaultBill('No items could be extracted from this image.');
+        return;
+      }
+
       setLoadingMessage('Analysing your bill with AI…');
 
       storeOCRResult(setBill, uri, result);
@@ -220,63 +240,23 @@ export default function ReviewScreen() {
         console.error('[Review] OCR FAILED — stack:', err.stack);
       }
 
-      switch (error.code) {
-        case 'NETWORK_ERROR':
-          Alert.alert(
-            'Connection Error',
-            'Cannot reach the SplitMate AI server.\n\nMake sure:\n• The backend is running\n• Your phone is on the same Wi-Fi as your computer\n• The IP in .env matches your computer\'s LAN address',
-          );
-          break;
-
-        case 'TIMEOUT':
-          Alert.alert(
-            'Request Timed Out',
-            'The server took too long to respond. Gemini AI may be busy — please try again in a moment.',
-          );
-          break;
-
-        case 'GEMINI_UNAVAILABLE':
-          Alert.alert(
-            'AI Service Busy',
-            'Gemini Vision is temporarily overloaded. Please wait a few seconds and try again.',
-          );
-          break;
-
-        case 'INVALID_IMAGE':
-          Alert.alert(
-            'Invalid Image',
-            error.message || 'The image format is not supported. Please use a JPEG, PNG, or WebP photo.',
-          );
-          break;
-
-        case 'UNREADABLE':
-          Alert.alert(
-            'Could Not Read Bill',
-            error.message || 'The image is too blurry or dark. Try retaking the photo with better lighting.',
-          );
-          break;
-
-        case 'NOT_FOUND':
-          Alert.alert(
-            'Server Error',
-            'The OCR endpoint was not found. Check that the backend is running and up to date.',
-          );
-          break;
-
-        case 'BAD_RESPONSE':
-          Alert.alert(
-            'Unexpected Response',
-            error.message || 'The server returned an unexpected response. Please try again.',
-          );
-          break;
-
-        default:
-          Alert.alert(
-            'Extraction Failed',
-            error.message || 'An unexpected error occurred. Please try again.',
-          );
-      }
+      showDefaultBill(error.message || 'Bill extraction is temporarily unavailable.');
     }
+  }
+
+  function showDefaultBill(reason: string) {
+    storeDemoBill(setBill, uri);
+    setLoading(false);
+    Alert.alert(
+      'Using sample bill',
+      `${reason}\n\nA sample bill is ready so you can continue. These items are examples and were not read from your photo.`,
+      [
+        {
+          text: 'Continue',
+          onPress: () => router.push({ pathname: '/scan/results', params: { uri } }),
+        },
+      ],
+    );
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -328,7 +308,7 @@ export default function ReviewScreen() {
               console.error('[Review] Image.onError — nativeError:', nativeError);
               console.error('[Review] Image.onError — uri type:', typeof uri, '| isArray:', Array.isArray(uri));
               console.error('[Review] Image.onError — uri (first 80):', String(uri).slice(0, 80));
-              setImageError(true);
+              setImageErrorUri(uri);
             }}
           />
         )}

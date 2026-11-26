@@ -10,12 +10,33 @@
  */
 
 import {
+    DEFAULT_TAX_RATE,
     applyRatePaise,
     fromPaise,
     lineTotalPaise,
     sumPaise,
     toPaise,
 } from '@/utils/currency';
+import { createId } from '@/utils/ids';
+import { normalizeBill } from '@/utils/billNormalization';
+import type { BillCurrency } from '@/types/splitSession';
+
+export type BillSource = 'ocr' | 'manual' | 'demo';
+
+export interface BillImageMetadata {
+  uri?: string;
+  originalFileName?: string;
+  mimeType?: string;
+  source?: 'camera' | 'gallery' | 'imported' | 'external';
+  storagePath?: string;
+  uploadedAt?: string;
+}
+
+export interface BillMetadata {
+  taxIsEstimated?: boolean;
+  validationWarnings?: string[];
+  [key: string]: unknown;
+}
 
 // ── Item ──────────────────────────────────────────────────────────────────────
 
@@ -26,6 +47,8 @@ export interface BillItem {
   qty: number;
   /** Unit price in PAISE (integer). Primary storage. */
   unitPricePaise: number;
+  /** Canonical line total in paise, derived from unitPricePaise × qty. */
+  lineTotalPaise: number;
   /**
    * Unit price in rupees (float convenience accessor).
    * Always equals unitPricePaise / 100.
@@ -41,9 +64,18 @@ export interface BillItem {
  * Full structured result returned after bill extraction.
  * When OCR/AI is not integrated, this is populated with demo data.
  */
-export interface ExtractedBill {
-  imageUri: string;
+export interface CanonicalBill {
+  id: string;
+  source: BillSource;
+  currency: BillCurrency;
+  imageUri?: string;
+  imageMetadata?: BillImageMetadata;
+  subtotalPaise: number;
+  taxPaise: number;
+  totalPaise: number;
   items: BillItem[];
+  createdAt: string;
+  metadata?: BillMetadata;
   /**
    * Subtotal printed on the bill as detected by OCR, in PAISE.
    * Null when the printed subtotal could not be read.
@@ -85,6 +117,9 @@ export interface ExtractedBill {
   geminiWarnings?: string[];
 }
 
+/** Backwards-compatible name used by the existing screens and store. */
+export type ExtractedBill = CanonicalBill;
+
 /** A validation warning returned by the backend. */
 export interface BillValidationWarning {
   code: string;
@@ -100,7 +135,7 @@ export type TipOption = 0 | 5 | 10 | 15 | 20;
 export const TIP_OPTIONS: TipOption[] = [0, 5, 10, 15, 20];
 
 /** GST rate for most Indian restaurants (5%). */
-export const DEFAULT_TAX_RATE = 0.05;
+export { DEFAULT_TAX_RATE };
 
 // ── Demo data ─────────────────────────────────────────────────────────────────
 
@@ -133,21 +168,34 @@ export function makeBillItem(
     name,
     qty,
     unitPricePaise,
+    lineTotalPaise: lineTotalPaise(unitPricePaise, qty),
     unitPrice: fromPaise(unitPricePaise),
     confidence,
   };
 }
 
-/** Build a fresh ExtractedBill from demo data for a given image URI. */
-export function buildDemoBill(imageUri: string): ExtractedBill {
-  return {
+/** Build a fresh canonical demo bill. The image is optional. */
+export function buildDemoBill(imageUri?: string): ExtractedBill {
+  const subtotalPaise = computeSubtotalPaise(DEMO_BILL_ITEMS);
+  const taxPaise = computeGSTPaise(subtotalPaise);
+  return normalizeBill({
+    id: createId(),
+    source: 'demo',
+    currency: 'INR',
     imageUri,
-    items: DEMO_BILL_ITEMS.map(item => ({ ...item })),
+    imageMetadata: imageUri ? { uri: imageUri, source: 'gallery' } : undefined,
+    items: DEMO_BILL_ITEMS.map(item => ({ ...item, id: createId() })),
     detectedSubtotalPaise: null,
     detectedSubtotal: null,
     detectedCurrency: 'INR',
+    detectedGstPaise: null,
+    detectedGrandTotalPaise: null,
+    taxPaise,
+    subtotalPaise,
+    totalPaise: subtotalPaise + taxPaise,
+    metadata: { taxIsEstimated: true },
     isDemoData: true,
-  };
+  });
 }
 
 // ── Computation helpers ───────────────────────────────────────────────────────
@@ -187,7 +235,7 @@ export function computeTotalPaise(
 
 /** Generate a unique id for manually added items. */
 export function generateItemId(): string {
-  return `item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  return createId();
 }
 
 /** Create a blank item ready for the Add modal. */
