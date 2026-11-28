@@ -5,16 +5,18 @@ OCR extraction endpoint for SplitMate AI.
 POST /api/ocr/extract
 ─────────────────────
 Accepts a multipart form upload (image + optional currency hint).
-Calls Gemini Vision, validates the response, and returns structured bill data.
+Calls the configured OCR provider, validates the response, and returns structured bill data.
 All amounts in the response are integer paise.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from pydantic import ValidationError
 
 from schemas.bill_schema import (
     CurrencyCode,
@@ -23,7 +25,9 @@ from schemas.bill_schema import (
     ValidationWarning as SchemaValidationWarning,
 )
 from services import gemini_service
-from services.validation_service import validate_bill, rupees_to_paise
+from services import paddleocr_service
+from services.ocr_provider import get_ocr_provider
+from services.validation_service import rupees_to_paise, validate_bill
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,7 @@ router = APIRouter(prefix="/api/ocr", tags=["OCR"])
 
 _ALLOWED_MIME: set[str] = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
 _MAX_BYTES: int = 10 * 1024 * 1024   # 10 MB
+_GEMINI_DEADLINE_SEC: float = 100.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,21 +48,22 @@ _MAX_BYTES: int = 10 * 1024 * 1024   # 10 MB
     summary="Extract bill items from an image",
     description=(
         "Upload a photo of a restaurant bill (JPEG, PNG, or WebP, max 10 MB). "
-        "Gemini Vision extracts line items, taxes, and totals. "
+        "The configured OCR provider extracts line items, taxes, and totals. "
         "All monetary values in the response are **integer paise** (₹1 = 100 paise)."
     ),
     responses={
         200: {"description": "Bill extracted successfully"},
         400: {"description": "Invalid file type, empty file, or oversized upload"},
-        422: {"description": "Gemini returned output that failed schema validation"},
-        503: {"description": "Gemini API key missing or service unavailable"},
+        422: {"description": "OCR output failed schema validation"},
+        503: {"description": "Selected OCR provider is not installed or unavailable"},
+        502: {"description": "The selected OCR provider returned an upstream error"},
     },
 )
 async def extract_bill(
     file: UploadFile = File(..., description="JPEG, PNG, or WebP image of the bill"),
     hint_currency: CurrencyCode = Form(
         default=CurrencyCode.INR,
-        description="Currency the user expects. Gemini may detect differently.",
+        description="Currency the user expects. OCR may detect differently.",
     ),
 ) -> OCRExtractResponse:
     # ── 1. Validate upload ────────────────────────────────────────────────────
@@ -97,8 +103,16 @@ async def extract_bill(
         hint_currency.value,
     )
 
-    # ── 2. Check Gemini is configured ─────────────────────────────────────────
-    if not gemini_service.is_configured():
+    # ── 2. Resolve the configured OCR provider ───────────────────────────────
+    try:
+        provider = get_ocr_provider()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+
+    if provider == "gemini" and not gemini_service.is_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
@@ -107,58 +121,147 @@ async def extract_bill(
             ),
         )
 
-    # ── 3. Call Gemini Vision ─────────────────────────────────────────────────
+    # ── 3. Call the selected provider ────────────────────────────────────────
+    paddle_result: Optional[paddleocr_service.PaddleOCRExtraction] = None
     try:
-        raw = await gemini_service.extract_bill_items(image_bytes, content_type)
-    except ValueError as exc:
-        # JSON parse failure or empty response
-        logger.warning("Gemini parse error: %s", exc)
+        if provider == "gemini":
+            raw = await asyncio.wait_for(
+                gemini_service.extract_bill_items(image_bytes, content_type),
+                timeout=_GEMINI_DEADLINE_SEC,
+            )
+        else:
+            paddle_result = await asyncio.wait_for(
+                paddleocr_service.extract_bill_items(image_bytes),
+                timeout=_GEMINI_DEADLINE_SEC,
+            )
+            raw = paddle_result.bill
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OCR exceeded the 100-second processing deadline. Please retry.",
+        )
+    except paddleocr_service.PaddleOCRUnavailableError as exc:
+        logger.error("Selected PaddleOCR provider is unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except paddleocr_service.PaddleOCRProcessingError as exc:
+        logger.warning("PaddleOCR could not process the uploaded image: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+    except gemini_service.GeminiOutputError as exc:
+        logger.warning("Gemini returned unusable output (%s): %s", exc.code, exc)
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         )
-    except Exception as exc:
-        # Gemini API error (quota, auth, server error, etc.)
-        logger.error("Gemini API error: %s", exc)
+    except ValueError as exc:
+        logger.warning("%s OCR output could not be parsed: %s", provider, exc)
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"Gemini Vision service error: {exc}. "
-                "Check your API key and quota, then retry."
-            ),
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
         )
+    except gemini_service.GeminiAPIError as exc:
+        code = exc.status_code
+        if code in {408, 429, 503, 504} or (code is not None and 500 <= code <= 599):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Gemini Vision is temporarily unavailable (upstream status {code}). Please retry.",
+            ) from exc
+        if code == 400:
+            detail = "Gemini rejected the OCR request as invalid. Check the configured model and request format."
+        elif code == 401:
+            detail = "Gemini authentication failed. Verify the backend API key configuration."
+        elif code == 403:
+            detail = "Gemini denied access. Check API permissions, billing, and model availability."
+        elif code == 404:
+            detail = "The configured Gemini model was not found. Check GEMINI_MODEL."
+        else:
+            detail = f"Gemini returned an upstream error (status {code or 'unknown'})."
+        logger.error("Gemini API error (status=%s): %s", code, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=detail,
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected %s OCR service error: %s", provider, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"The {provider} OCR provider returned an unexpected processing error.",
+        ) from exc
 
     # ── 4. Build extracted items (convert raw floats → paise) ─────────────────
     item_dicts = gemini_service.build_extracted_items(raw)
 
-    # Validate each item dict before constructing Pydantic models
+    # Keep every generated item in the response, using a safe placeholder only
+    # if an item cannot be represented by the public response schema.
     validated_items: list[ExtractedItemSchema] = []
     item_schema_warnings: list[str] = []
 
-    for d in item_dicts:
+    item_warnings: list[str] = []
+    for index, d in enumerate(item_dicts, start=1):
+        item_warnings.extend(d.get("gemini_warnings", []))
+        clean_item = {key: value for key, value in d.items() if key != "gemini_warnings"}
         try:
-            validated_items.append(ExtractedItemSchema(**d))
-        except Exception as exc:
+            validated_items.append(ExtractedItemSchema(**clean_item))
+        except (ValidationError, TypeError, ValueError) as exc:
             item_schema_warnings.append(
-                f"Item '{d.get('name', '?')}' failed validation and was skipped: {exc}"
+                f"Item {index} could not be represented exactly and was retained with safe values: {exc}"
             )
-            logger.warning("Item schema error: %s", exc)
+            fallback = {
+                "id": str(clean_item.get("id") or f"ocr_unreadable_{index}"),
+                "name": str(clean_item.get("name") or f"Unreadable item {index}").strip()
+                or f"Unreadable item {index}",
+                "qty": clean_item.get("qty", 1.0),
+                "unit_price_paise": clean_item.get("unit_price_paise", 0),
+                "line_total_paise": clean_item.get("line_total_paise", 0),
+                "unit_price_inferred": bool(clean_item.get("unit_price_inferred", False)),
+                "confidence": 0.3,
+            }
+            try:
+                validated_items.append(ExtractedItemSchema(**fallback))
+            except (ValidationError, TypeError, ValueError):
+                validated_items.append(
+                    ExtractedItemSchema(
+                        id=f"ocr_unreadable_{index}",
+                        name=f"Unreadable item {index}",
+                        qty=1.0,
+                        unit_price_paise=0,
+                        line_total_paise=0,
+                        confidence=0.0,
+                    )
+                )
 
     # ── 5. Convert bill-level amounts to paise ────────────────────────────────
     detected_subtotal_paise  = _to_paise(raw.subtotal)
-    detected_gst_paise       = _to_paise(raw.gst_amount)
-    detected_discount_paise  = _to_paise(raw.discount_amount)
-    detected_service_paise   = _to_paise(raw.service_charge)
+    detected_gst_paise       = _to_paise(raw.gst_amount, absolute=True)
+    detected_discount_paise  = _to_paise(raw.discount_amount, absolute=True)
+    detected_service_paise   = _to_paise(raw.service_charge, absolute=True)
+    detected_other_charges_paise = _to_paise(raw.other_charges)
+    detected_round_off_paise = _to_paise(raw.round_off)
     detected_grand_paise     = _to_paise(raw.grand_total)
 
     # ── 6. Validate arithmetic ────────────────────────────────────────────────
+    detected_currency_str = (raw.currency or "UNKNOWN").upper()
+    try:
+        detected_currency = CurrencyCode(detected_currency_str)
+    except ValueError:
+        detected_currency = CurrencyCode.UNKNOWN
+
+    validation_items = [item.model_dump() for item in validated_items]
     validation = validate_bill(
-        items=item_dicts,
+        items=validation_items,
         detected_subtotal_paise=detected_subtotal_paise,
         detected_gst_paise=detected_gst_paise,
         detected_discount_paise=detected_discount_paise,
         detected_service_charge_paise=detected_service_paise,
         detected_grand_total_paise=detected_grand_paise,
+        detected_other_charges_paise=detected_other_charges_paise,
+        detected_round_off_paise=detected_round_off_paise,
+        currency=detected_currency.value,
     )
 
     # Map validation warnings to schema model
@@ -167,12 +270,6 @@ async def extract_bill(
     ]
 
     # ── 7. Currency mismatch flag ─────────────────────────────────────────────
-    detected_currency_str = (raw.currency or "UNKNOWN").upper()
-    try:
-        detected_currency = CurrencyCode(detected_currency_str)
-    except ValueError:
-        detected_currency = CurrencyCode.UNKNOWN
-
     currency_mismatch = (
         detected_currency != CurrencyCode.UNKNOWN
         and detected_currency != hint_currency
@@ -186,7 +283,9 @@ async def extract_bill(
 
     # ── 8. Compose response ───────────────────────────────────────────────────
     total_items = len(validated_items)
-    all_warnings = raw.warnings + item_schema_warnings
+    all_warnings = list(dict.fromkeys(
+        raw.warnings + item_warnings + item_schema_warnings
+    ))
 
     message_parts = [f"{total_items} item(s) extracted."]
     if validation.has_mismatch:
@@ -206,6 +305,9 @@ async def extract_bill(
     return OCRExtractResponse(
         success=True,
         is_demo_data=False,
+        ocr_provider=provider,
+        ocr_text=paddle_result.text if paddle_result else None,
+        ocr_regions=paddle_result.regions if paddle_result else [],
         restaurant_name=raw.restaurant_name,
         detected_currency=detected_currency,
         currency_mismatch=currency_mismatch,
@@ -214,12 +316,15 @@ async def extract_bill(
         detected_gst_paise=detected_gst_paise,
         detected_discount_paise=detected_discount_paise,
         detected_service_charge_paise=detected_service_paise,
+        detected_other_charges_paise=detected_other_charges_paise,
+        detected_round_off_paise=detected_round_off_paise,
         detected_grand_total_paise=detected_grand_paise,
         computed_subtotal_paise=validation.computed_subtotal_paise,
         computed_grand_total_paise=validation.computed_grand_total_paise,
         validation_warnings=schema_warnings,
         has_mismatch=validation.has_mismatch,
         overall_confidence=raw.overall_confidence,
+        provider_warnings=all_warnings,
         gemini_warnings=all_warnings,
         message=" ".join(message_parts),
     )
@@ -229,8 +334,13 @@ async def extract_bill(
 # Internal helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _to_paise(rupees: Optional[float]) -> Optional[int]:
+def _to_paise(
+    rupees: Optional[float],
+    *,
+    absolute: bool = False,
+) -> Optional[int]:
     """None-safe rupee float → integer paise."""
     if rupees is None:
         return None
-    return round(rupees * 100)
+    amount = abs(rupees) if absolute else rupees
+    return rupees_to_paise(amount)

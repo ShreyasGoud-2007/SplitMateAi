@@ -26,8 +26,10 @@ import {
     makeBillItem,
     makeBlankItem
 } from '@/types/bill';
-import { applyRatePaise, formatPaise, fromPaise, toPaise } from '@/utils/currency';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { applyRatePaise, fromPaise, toPaise } from '@/utils/currency';
+import { formatSplitCurrency } from '@/utils/splitCurrency';
+import type { BillCurrency } from '@/types/splitSession';
+import { useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import {
     AlertTriangle,
@@ -35,7 +37,7 @@ import {
     Check,
     CheckCircle2,
     ChevronRight,
-    IndianRupee,
+    Coins,
     Info,
     Pencil,
     Plus,
@@ -47,7 +49,7 @@ import {
     Users,
     X,
 } from 'lucide-react-native';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
     Alert,
     Image,
@@ -70,32 +72,25 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 interface ItemModalProps {
   /** null → modal is closed */
   item: BillItem | null;
+  currency: BillCurrency;
   onSave: (item: BillItem) => void;
   onClose: () => void;
 }
 
-function ItemModal({ item, onSave, onClose }: ItemModalProps) {
+function ItemModal({ item, currency, onSave, onClose }: ItemModalProps) {
   const isNew = !item || item.unitPricePaise === 0 && item.name === '';
-  const [name,  setName]  = useState('');
-  const [qty,   setQty]   = useState('1');
-  const [price, setPrice] = useState('');   // rupees string from user
+  const [name, setName] = useState(item?.name ?? '');
+  const [qty, setQty] = useState(String(item?.qty ?? 1));
+  const [price, setPrice] = useState(
+    item && item.unitPricePaise > 0 ? String(fromPaise(item.unitPricePaise)) : '',
+  );
 
-  /* Re-populate whenever the target item changes */
-  useEffect(() => {
-    if (item) {
-      setName(item.name);
-      setQty(String(item.qty));
-      // Show rupees (not paise) in the input field
-      setPrice(item.unitPricePaise > 0 ? String(fromPaise(item.unitPricePaise)) : '');
-    }
-  }, [item?.id]);              // only re-sync when the id changes
-
-  const parsedQty   = parseInt(qty,   10);
+  const parsedQty   = parseFloat(qty);
   const parsedPrice = parseFloat(price);
-  const validQty    = !isNaN(parsedQty)   && parsedQty   >= 1;
+  const validQty    = Number.isFinite(parsedQty) && parsedQty > 0;
   const validPrice  = !isNaN(parsedPrice) && parsedPrice >= 0;
   const previewPaise = validQty && validPrice
-    ? toPaise(parsedPrice) * parsedQty
+    ? Math.round(toPaise(parsedPrice) * parsedQty)
     : null;
 
   function handleSave() {
@@ -104,11 +99,11 @@ function ItemModal({ item, onSave, onClose }: ItemModalProps) {
       return;
     }
     if (!validQty) {
-      Alert.alert('Validation', 'Quantity must be at least 1.');
+      Alert.alert('Validation', 'Quantity must be greater than zero.');
       return;
     }
     if (!validPrice) {
-      Alert.alert('Validation', 'Please enter a valid price (₹).');
+      Alert.alert('Validation', `Please enter a valid price (${currency}).`);
       return;
     }
     const paise = toPaise(parsedPrice);
@@ -167,7 +162,7 @@ function ItemModal({ item, onSave, onClose }: ItemModalProps) {
               />
             </View>
             <View style={[modal.fieldGroup, { flex: 2 }]}>
-              <Text style={modal.label}>Unit Price (₹)</Text>
+              <Text style={modal.label}>Unit Price ({currency})</Text>
               <TextInput
                 style={modal.input}
                 value={price}
@@ -185,7 +180,7 @@ function ItemModal({ item, onSave, onClose }: ItemModalProps) {
           {previewPaise !== null && (
             <View style={modal.preview}>
               <Text style={modal.previewLabel}>Line total</Text>
-              <Text style={modal.previewValue}>{formatPaise(previewPaise)}</Text>
+              <Text style={modal.previewValue}>{formatSplitCurrency(previewPaise, currency)}</Text>
             </View>
           )}
 
@@ -269,51 +264,60 @@ const modal = StyleSheet.create({
 interface ValidationCardProps {
   computedPaise: number;
   detectedPaise: number | null;
+  currency: BillCurrency;
   detectedGstPaise: number | null;
   detectedDiscountPaise: number | null;
   detectedServiceChargePaise: number | null;
+  detectedOtherChargesPaise: number | null;
+  detectedRoundOffPaise: number | null;
   detectedGrandTotalPaise: number | null;
   tipPaise: number;
   totalPaise: number;
   validationWarnings?: BillValidationWarning[];
+  normalizationWarnings?: string[];
 }
 
 function ValidationCard({
   computedPaise,
   detectedPaise,
+  currency,
   detectedGstPaise,
   detectedDiscountPaise,
   detectedServiceChargePaise,
+  detectedOtherChargesPaise,
+  detectedRoundOffPaise,
   detectedGrandTotalPaise,
   tipPaise,
   totalPaise,
   validationWarnings,
+  normalizationWarnings,
 }: ValidationCardProps) {
   const hasMismatch =
     detectedPaise !== null && Math.abs(computedPaise - detectedPaise) > 50; // >50 paise diff
   const diff = detectedPaise !== null ? computedPaise - detectedPaise : 0;
-  const hasBackendWarnings = (validationWarnings?.length ?? 0) > 0;
+  const hasValidationWarnings =
+    (validationWarnings?.length ?? 0) + (normalizationWarnings?.length ?? 0) > 0;
 
   return (
     <View style={vCard.card}>
       {/* Header */}
       <View style={vCard.header}>
-        {hasMismatch || hasBackendWarnings ? (
+        {hasMismatch || hasValidationWarnings ? (
           <AlertTriangle size={16} color="#b45309" strokeWidth={2} />
         ) : (
           <ShieldCheck size={16} color={Colors.primary} strokeWidth={2} />
         )}
-        <Text style={[vCard.headerTitle, (hasMismatch || hasBackendWarnings) && vCard.headerTitleWarn]}>
-          {hasMismatch || hasBackendWarnings ? 'Bill Validation — Issues Found' : 'Bill Validation'}
+        <Text style={[vCard.headerTitle, (hasMismatch || hasValidationWarnings) && vCard.headerTitleWarn]}>
+          {hasMismatch || hasValidationWarnings ? 'Bill Validation — Issues Found' : 'Bill Validation'}
         </Text>
       </View>
 
       {/* Rows */}
       <View style={vCard.body}>
-        <VRow label="Items subtotal (computed)" value={formatPaise(computedPaise)} />
+        <VRow label="Items subtotal (computed)" value={formatSplitCurrency(computedPaise, currency)} />
 
         {detectedPaise !== null ? (
-          <VRow label="Subtotal on bill (detected)" value={formatPaise(detectedPaise)} />
+          <VRow label="Subtotal on bill (detected)" value={formatSplitCurrency(detectedPaise, currency)} />
         ) : (
           <VRow label="Subtotal on bill" value="Not detected" muted />
         )}
@@ -321,7 +325,7 @@ function ValidationCard({
         {hasMismatch && (
           <VRow
             label={`Difference (${diff > 0 ? 'over' : 'under'})`}
-            value={`${diff > 0 ? '+' : '−'}${formatPaise(Math.abs(diff))}`}
+            value={`${diff > 0 ? '+' : '−'}${formatSplitCurrency(Math.abs(diff), currency)}`}
             warn
           />
         )}
@@ -330,44 +334,56 @@ function ValidationCard({
 
         {/* GST — show detected value from bill when available */}
         {detectedGstPaise !== null && detectedGstPaise !== undefined ? (
-          <VRow label="GST (on bill)" value={formatPaise(detectedGstPaise)} />
+          <VRow label="GST (on bill)" value={formatSplitCurrency(detectedGstPaise, currency)} />
         ) : (
-          <VRow label="GST (estimated 5%)" value={formatPaise(applyRatePaise(computedPaise, 0.05))} />
+          <VRow label="GST (estimated 5%)" value={formatSplitCurrency(applyRatePaise(computedPaise, 0.05), currency)} />
         )}
 
         {/* Discount */}
         {detectedDiscountPaise !== null && detectedDiscountPaise !== undefined && detectedDiscountPaise > 0 && (
-          <VRow label="Discount" value={`−${formatPaise(detectedDiscountPaise)}`} />
+          <VRow label="Discount" value={`−${formatSplitCurrency(detectedDiscountPaise, currency)}`} />
         )}
 
         {/* Service charge */}
         {detectedServiceChargePaise !== null && detectedServiceChargePaise !== undefined && detectedServiceChargePaise > 0 && (
-          <VRow label="Service charge" value={formatPaise(detectedServiceChargePaise)} />
+          <VRow label="Service charge" value={formatSplitCurrency(detectedServiceChargePaise, currency)} />
         )}
 
-        {tipPaise > 0 && <VRow label="Tip" value={formatPaise(tipPaise)} />}
+        {detectedOtherChargesPaise !== null && detectedOtherChargesPaise > 0 && (
+          <VRow label="Other charges" value={formatSplitCurrency(detectedOtherChargesPaise, currency)} />
+        )}
+        {detectedRoundOffPaise !== null && detectedRoundOffPaise !== 0 && (
+          <VRow label="Round-off" value={formatSplitCurrency(detectedRoundOffPaise, currency)} />
+        )}
+        {tipPaise > 0 && <VRow label="Tip" value={formatSplitCurrency(tipPaise, currency)} />}
 
         <View style={vCard.divider} />
 
         {/* Grand total */}
-        <VRow label="Grand Total" value={formatPaise(totalPaise)} bold />
+        <VRow label="Grand Total" value={formatSplitCurrency(totalPaise, currency)} bold />
 
         {/* Detected grand total for comparison */}
         {detectedGrandTotalPaise !== null && detectedGrandTotalPaise !== undefined && (
-          <VRow label="Grand total on bill" value={formatPaise(detectedGrandTotalPaise)} muted />
+          <VRow label="Grand total on bill" value={formatSplitCurrency(detectedGrandTotalPaise, currency)} muted />
         )}
       </View>
 
       {/* Backend validation warnings */}
-      {hasBackendWarnings && validationWarnings!.map((w, i) => (
+      {validationWarnings?.map((w, i) => (
         <View key={i} style={vCard.hint}>
           <Info size={13} color="#92400e" strokeWidth={2} />
           <Text style={vCard.hintText}>{w.message}</Text>
         </View>
       ))}
+      {normalizationWarnings?.map((warning, index) => (
+        <View key={`normalization-${index}`} style={vCard.hint}>
+          <Info size={13} color="#92400e" strokeWidth={2} />
+          <Text style={vCard.hintText}>{warning}</Text>
+        </View>
+      ))}
 
       {/* Mismatch hint */}
-      {hasMismatch && !hasBackendWarnings && (
+      {hasMismatch && !hasValidationWarnings && (
         <View style={vCard.hint}>
           <Info size={13} color="#92400e" strokeWidth={2} />
           <Text style={vCard.hintText}>
@@ -449,13 +465,14 @@ const vCard = StyleSheet.create({
 interface ItemRowProps {
   item: BillItem;
   index: number;
+  currency: BillCurrency;
   onEdit: (item: BillItem) => void;
   onDelete: (id: string) => void;
   isLast: boolean;
 }
 
-function ItemRow({ item, index, onEdit, onDelete, isLast }: ItemRowProps) {
-  const linePaise = item.unitPricePaise * item.qty;
+function ItemRow({ item, index, currency, onEdit, onDelete, isLast }: ItemRowProps) {
+  const linePaise = item.lineTotalPaise;
   const lowConf   = item.confidence !== undefined && item.confidence < 0.8;
 
   return (
@@ -475,12 +492,12 @@ function ItemRow({ item, index, onEdit, onDelete, isLast }: ItemRowProps) {
           </View>
           {/* Always show unit price + qty breakdown */}
           <Text style={row.meta}>
-            {item.qty} × {formatPaise(item.unitPricePaise)}
+            {item.qty} × {formatSplitCurrency(item.unitPricePaise, currency)}
           </Text>
         </View>
 
         {/* Line total */}
-        <Text style={row.total}>{formatPaise(linePaise)}</Text>
+        <Text style={row.total}>{formatSplitCurrency(linePaise, currency)}</Text>
 
         {/* Edit button */}
         <TouchableOpacity
@@ -543,21 +560,26 @@ const row = StyleSheet.create({
 
 export default function ResultsScreen() {
   const router      = useRouter();
-  const { uri }     = useLocalSearchParams<{ uri?: string }>();
   const { getBill, setBill, getSplitSession, setItemAssignments } = useBillStore();
 
   /* Hydrate from store on first render */
   const storedBill         = getBill();
+  const imageUri           = storedBill?.imageUri ?? storedBill?.imageMetadata?.uri;
   const [items, setItems]  = useState<BillItem[]>(storedBill?.items ?? []);
   const isDemoData         = storedBill?.isDemoData ?? true;
+  const currency           = storedBill?.currency ?? 'INR';
+  const currencyMismatch   = storedBill?.currencyMismatch ?? false;
   const detectedPaise      = storedBill?.detectedSubtotalPaise ?? null;
   const detectedGstPaise   = storedBill?.detectedGstPaise ?? null;
   const detectedDiscountPaise = storedBill?.detectedDiscountPaise ?? null;
   const detectedServiceChargePaise = storedBill?.detectedServiceChargePaise ?? null;
+  const detectedOtherChargesPaise = storedBill?.detectedOtherChargesPaise ?? null;
+  const detectedRoundOffPaise = storedBill?.detectedRoundOffPaise ?? null;
   const detectedGrandTotalPaise = storedBill?.detectedGrandTotalPaise ?? null;
   const restaurantName     = storedBill?.restaurantName ?? null;
   const overallConfidence  = storedBill?.overallConfidence;
   const validationWarnings = storedBill?.validationWarnings;
+  const normalizationWarnings = storedBill?.metadata?.validationWarnings;
   const geminiWarnings     = storedBill?.geminiWarnings;
 
   const [selectedTip, setSelectedTip] = useState<TipOption>(0);
@@ -576,7 +598,13 @@ export default function ResultsScreen() {
   // Grand total = subtotal + gst + service_charge + tip - discount
   const serviceChargePaise = detectedServiceChargePaise ?? 0;
   const discountPaise = detectedDiscountPaise ?? 0;
-  const totalPaise    = subtotalPaise + gstPaise + serviceChargePaise + tipPaise - discountPaise;
+  const otherChargesPaise = detectedOtherChargesPaise ?? 0;
+  const roundOffPaise = detectedRoundOffPaise ?? 0;
+  const totalPaise = Math.max(
+    0,
+    subtotalPaise + gstPaise + serviceChargePaise + otherChargesPaise
+      + roundOffPaise + tipPaise - discountPaise,
+  );
 
   /* ── Item mutations ─────────────────────────────────────────────────── */
   const handleSaveItem = useCallback((updated: BillItem) => {
@@ -590,7 +618,7 @@ export default function ResultsScreen() {
     if (currentBill) setBill({ ...currentBill, items: next });
     setItemAssignments({});
     setEditTarget(null);
-  }, [getBill, items, setBill, setItemAssignments]);
+  }, [getBill, items, setBill, setItemAssignments, setEditTarget]);
 
   const handleDelete = useCallback((id: string) => {
     const next = (getBill()?.items ?? items).filter(i => i.id !== id);
@@ -602,7 +630,7 @@ export default function ResultsScreen() {
 
   const handleAdd = useCallback(() => {
     setEditTarget(makeBlankItem());
-  }, []);
+  }, [setEditTarget]);
 
   /* ── Render ──────────────────────────────────────────────────────────── */
   return (
@@ -610,7 +638,9 @@ export default function ResultsScreen() {
       <StatusBar style="dark" />
 
       <ItemModal
+        key={editTarget?.id ?? 'closed'}
         item={editTarget}
+        currency={currency}
         onSave={handleSaveItem}
         onClose={() => setEditTarget(null)}
       />
@@ -625,7 +655,7 @@ export default function ResultsScreen() {
           <View style={s.badge}>
             <CheckCircle2 size={12} color={Colors.primary} strokeWidth={2.5} />
             <Text style={s.badgeText}>
-              {isDemoData ? 'Demo data · INR' : 'AI Extracted · INR'}
+              {isDemoData ? `Demo data · ${currency}` : `AI Extracted · ${currency}`}
             </Text>
           </View>
         </View>
@@ -640,10 +670,19 @@ export default function ResultsScreen() {
         keyboardShouldPersistTaps="handled"
       >
 
+        {currencyMismatch && (
+          <View style={s.currencyMismatchBanner}>
+            <Info size={14} color="#92400e" strokeWidth={2} />
+            <Text style={s.currencyMismatchText}>
+              Detected currency ({storedBill?.detectedCurrency}) differs from your selected currency.
+            </Text>
+          </View>
+        )}
+
         {/* ── Bill image preview ── */}
-        {uri ? (
+        {imageUri ? (
           <View style={s.previewRow}>
-            <Image source={{ uri }} style={s.previewThumb} resizeMode="cover" />
+            <Image source={{ uri: imageUri }} style={s.previewThumb} resizeMode="cover" />
             <View style={s.previewMeta}>
               <View style={s.chip}>
                 <Sparkles size={11} color={Colors.primary} strokeWidth={2} />
@@ -717,6 +756,7 @@ export default function ResultsScreen() {
                 key={item.id}
                 item={item}
                 index={idx}
+                currency={currency}
                 onEdit={setEditTarget}
                 onDelete={handleDelete}
                 isLast={idx === items.length - 1}
@@ -736,7 +776,7 @@ export default function ResultsScreen() {
         {/* ── Tip selector ── */}
         <View style={s.card}>
           <View style={s.cardHeader}>
-            <IndianRupee size={16} color={Colors.textPrimary} strokeWidth={2} />
+            <Coins size={16} color={Colors.textPrimary} strokeWidth={2} />
             <Text style={s.cardTitle}>Add a Tip</Text>
           </View>
           <View style={s.tipRow}>
@@ -759,13 +799,17 @@ export default function ResultsScreen() {
         <ValidationCard
           computedPaise={subtotalPaise}
           detectedPaise={detectedPaise}
+          currency={currency}
           detectedGstPaise={detectedGstPaise}
           detectedDiscountPaise={detectedDiscountPaise}
           detectedServiceChargePaise={detectedServiceChargePaise}
+          detectedOtherChargesPaise={detectedOtherChargesPaise}
+          detectedRoundOffPaise={detectedRoundOffPaise}
           detectedGrandTotalPaise={detectedGrandTotalPaise}
           tipPaise={tipPaise}
           totalPaise={totalPaise}
           validationWarnings={validationWarnings}
+          normalizationWarnings={normalizationWarnings}
         />
 
         {/* ── Split Bill CTA ── */}
@@ -836,6 +880,8 @@ const s = StyleSheet.create({
   /* Demo notice */
   notice:     { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: Colors.primaryLight, borderRadius: 12, padding: 12 },
   noticeText: { flex: 1, fontSize: 12, color: Colors.primary, lineHeight: 18, fontWeight: '500' },
+  currencyMismatchBanner: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, backgroundColor: '#fffbeb', borderRadius: 12, padding: 12 },
+  currencyMismatchText: { flex: 1, fontSize: 12, color: '#92400e', lineHeight: 18, fontWeight: '500' },
 
   /* Cards */
   card:       { backgroundColor: Colors.cardBg, borderRadius: 16, borderWidth: 1.5, borderColor: Colors.border, overflow: 'hidden', ...Platform.select({ android: { elevation: 2 } }) },

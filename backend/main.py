@@ -7,7 +7,7 @@ Start the development server:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 The backend is kept separate from the React Native / Expo frontend.
-Gemini API keys live exclusively here, never in the mobile app.
+OCR providers and their credentials are configured here, never in the mobile app.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routes.ocr import router as ocr_router
 from schemas.bill_schema import HealthResponse
+from services.ocr_provider import get_ocr_provider
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
@@ -47,45 +48,43 @@ logger = logging.getLogger("splitmate")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Log startup state and validate configuration."""
-    gemini_key = os.getenv("GEMINI_API_KEY", "")
-    gemini_model = os.getenv("GEMINI_MODEL", "")
+    """Log the selected provider and validate only its required configuration."""
+    provider = get_ocr_provider()
+    logger.info("OCR provider selected: %s", provider)
 
-    # ── Startup validation ───────────────────────────────────────────────────
-    if not gemini_key or not gemini_key.strip():
-        logger.error(
-            "GEMINI_API_KEY is not set or empty — OCR endpoint will return 503. "
-            "Add your API key to backend/.env and restart the server."
-        )
-    else:
-        # Confirm the key loaded without leaking it.
-        logger.info("Gemini API key loaded (prefix: %s…)", gemini_key[:8])
+    if provider == "gemini":
+        gemini_key = os.getenv("GEMINI_API_KEY", "")
+        gemini_model = os.getenv("GEMINI_MODEL", "")
 
-    if not gemini_model or not gemini_model.strip():
-        logger.error(
-            "GEMINI_MODEL is not set — using default. "
-            "Set GEMINI_MODEL in backend/.env to specify the model name."
-        )
-    else:
-        logger.info("Gemini model: %s", gemini_model)
+        if not gemini_key or not gemini_key.strip():
+            logger.error(
+                "GEMINI_API_KEY is not set or empty — Gemini OCR requests return 503. "
+                "Add the key to backend/.env and restart the server."
+            )
+        else:
+            logger.info("Gemini API key is configured.")
 
-    # Warn if the SDK itself is unavailable
-    try:
+        if not gemini_model or not gemini_model.strip():
+            logger.error(
+                "GEMINI_MODEL is not set — Gemini OCR requests cannot run. "
+                "Set GEMINI_MODEL in backend/.env."
+            )
+        else:
+            logger.info("Gemini model: %s", gemini_model)
+
         from services import gemini_service
         if not gemini_service._GENAI_AVAILABLE:
             logger.error(
                 "google-genai package is not installed. "
-                "Run: pip install google-genai"
+                "Run: pip install -r requirements.txt"
             )
-        elif not gemini_service.is_configured():
-            logger.error(
-                "Gemini is not fully configured. "
-                "Check GEMINI_API_KEY and GEMINI_MODEL in backend/.env."
-            )
-        else:
+        elif gemini_service.is_configured():
             logger.info("Gemini OCR service ready.")
-    except Exception as exc:
-        logger.error("Failed to initialise Gemini service: %s", exc)
+    else:
+        logger.info(
+            "PaddleOCR CPU provider selected (PP-OCRv5 mobile models; "
+            "models initialize lazily on the first OCR request)."
+        )
 
     logger.info("SplitMate AI backend starting up.")
     yield
@@ -97,9 +96,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="SplitMate AI",
     description=(
-        "Backend API for the SplitMate AI Android application. "
-        "Handles Gemini Vision OCR for restaurant bill extraction and splitting. "
-        "All Gemini API keys are stored exclusively on this server."
+        "Backend API for the SplitMate AI application. "
+        "Supports Gemini Vision and CPU PaddleOCR for restaurant bill extraction."
     ),
     version="0.1.0",
     lifespan=lifespan,
@@ -119,14 +117,16 @@ CORS_ORIGINS: list[str] = [
     "http://localhost:19002",
     # Expo web
     "http://localhost:3000",
-    # LAN address used by Expo Go on a physical Android device
-    # (replace with your machine's local IP when testing on a real device)
-    "http://192.168.1.0/24",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=(
+        r"^https?://(?:(?:localhost|127(?:\.\d{1,3}){3})|"
+        r"10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|"
+        r"172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2})(?::\d+)?$"
+    ),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],

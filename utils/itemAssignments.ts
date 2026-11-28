@@ -2,7 +2,7 @@ import type { BillItem } from '@/types/bill';
 import type { ItemAssignment } from '@/types/itemAssignment';
 
 export function getItemTotalPaise(item: BillItem): number {
-  return Math.max(0, Math.round(item.unitPricePaise * item.qty));
+  return Math.max(0, item.lineTotalPaise);
 }
 
 export function getItemAllocationAmounts(

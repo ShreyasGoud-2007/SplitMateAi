@@ -9,9 +9,9 @@ Uses google-genai 3.x SDK:
     )
 
 Reliability:
-    - Retries 429 (rate limit) and 503 (service unavailable) with exponential
+    - Retries transient 408/429/5xx errors and request timeouts with exponential
       backoff, up to MAX_ATTEMPTS times.
-    - Permanent 4xx errors (400, 401, 403, 404) are NOT retried.
+    - Permanent client errors are NOT retried.
     - Model-not-found (404) returns a clear message explaining how to list
       supported models via the SDK.
 
@@ -26,9 +26,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,8 @@ except ImportError:
     logger.warning("google-genai package not installed — Gemini OCR unavailable.")
 
 # ── Local imports ─────────────────────────────────────────────────────────────
-from schemas.bill_schema import RawGeminiOutput, RawItemSchema
+from schemas.bill_schema import RawGeminiOutput, RawItemSchema, parse_currency_amount
+from services.validation_service import rupees_to_paise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,10 +87,24 @@ INITIAL_BACKOFF_SEC: float = 1.0      # first retry waits 1 s; then 2 s, 4 s …
 MAX_BACKOFF_SEC: float = 8.0          # cap a single wait
 
 # HTTP status codes that are worth retrying (temporary failures)
-_RETRYABLE_STATUS_CODES: set[int] = {429, 503}
+_RETRYABLE_STATUS_CODES: set[int] = {408, 429, 503, 504}
 
 # Request timeout for the Gemini API call (seconds)
 _GEMINI_TIMEOUT_SEC: float = 60.0
+_MAX_OUTPUT_TOKENS: int = 8192
+_THINKING_BUDGET: int = 128
+
+
+class GeminiAPIError(RuntimeError):
+    def __init__(self, status_code: Optional[int], message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class GeminiOutputError(ValueError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -102,16 +119,22 @@ a single, valid JSON object — nothing else.
 RULES (follow strictly):
 1. Output ONLY the JSON object. No markdown, no code fences, no prose.
 2. Do NOT invent values for fields you cannot read. Use null instead.
-3. All monetary amounts must be in the currency printed on the bill.
-   Convert to that currency's smallest sub-unit (e.g. paise for INR,
-   cents for USD) only if you are certain of the value.
-   Return amounts as FLOATS in the currency's major unit (e.g. rupees,
-   dollars) — the backend will convert to integer sub-units.
+3. Return all amounts as decimal numbers in the major currency unit exactly
+   as printed (e.g. 180.50). Never convert to paise or cents.
 4. For currency: use "INR", "USD", "EUR", "GBP", or "UNKNOWN" if unclear.
 5. Confidence scores: 0.0 (unreadable) to 1.0 (perfectly clear).
 6. If an item total does not equal qty × unit_price, record both as you read
    them and add a warning string explaining the discrepancy.
-7. Support handwritten bills, printed receipts, and photos of screens.
+7. items[] contains ONLY purchasable line items. Never include subtotal, tax,
+   CGST, SGST, IGST, VAT, GST, service charge, discount, round-off,
+   packaging/delivery fee, tip, or total lines as items.
+8. gst_amount is the sum of all tax lines (CGST + SGST + IGST + VAT).
+9. Discounts are positive numbers. Keep packaging/delivery/etc. in
+   other_charges and bill rounding adjustments in round_off.
+10. Read Indian number formats such as "1,250.00", "Rs.", and "₹" correctly.
+    In tables, Rate/Price is the unit price; Amount is the line total.
+11. Skip void or cancelled items.
+12. Support handwritten bills, printed receipts, and photos of screens.
 
 REQUIRED JSON STRUCTURE:
 {
@@ -129,6 +152,8 @@ REQUIRED JSON STRUCTURE:
   "gst_amount": number | null,
   "discount_amount": number | null,
   "service_charge": number | null,
+  "other_charges": number | null,
+  "round_off": number | null,
   "grand_total": number | null,
   "currency": string,
   "overall_confidence": number,
@@ -144,21 +169,132 @@ REQUIRED JSON STRUCTURE:
 def _to_paise(rupees: Optional[float]) -> Optional[int]:
     if rupees is None:
         return None
-    return round(rupees * 100)
+    return rupees_to_paise(rupees)
 
-def _item_to_paise(raw: RawItemSchema) -> tuple[int, int]:
-    qty = max(int(round(raw.qty)), 1)
+def _item_to_paise(raw: RawItemSchema) -> tuple[int, int, bool]:
+    qty = raw.qty
+    unit_price_paise = (
+        rupees_to_paise(abs(raw.unit_price)) if raw.unit_price is not None else None
+    )
+    line_total_paise = (
+        rupees_to_paise(abs(raw.item_total)) if raw.item_total is not None else None
+    )
 
-    if raw.unit_price is not None:
-        up = round(raw.unit_price * 100)
-        lt = up * qty
-    elif raw.item_total is not None:
-        lt = round(raw.item_total * 100)
-        up = lt // qty
+    if line_total_paise is not None:
+        if unit_price_paise is None:
+            unit_price_paise = int(
+                (Decimal(line_total_paise) / Decimal(str(qty))).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            )
+            unit_price_inferred = True
+        else:
+            unit_price_inferred = False
+    elif unit_price_paise is not None:
+        line_total_paise = int(
+            (Decimal(unit_price_paise) * Decimal(str(qty))).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
+        unit_price_inferred = False
     else:
-        up, lt = 0, 0
+        unit_price_paise = 0
+        line_total_paise = 0
+        unit_price_inferred = False
 
-    return up, lt
+    return unit_price_paise, line_total_paise, unit_price_inferred
+
+
+_NON_ITEM_LINE = re.compile(
+    r"^(?:sub[\s-]*total|grand[\s-]*total|total|tax|gst|cgst|sgst|igst|vat|"
+    r"service[\s-]*charge|other[\s-]*charge|discount|round(?:[\s-]*off|ing)|"
+    r"packaging|delivery|tip)\b",
+    re.IGNORECASE,
+)
+_VOID_ITEM = re.compile(r"\b(?:void|cancel(?:led|ed)?)\b", re.IGNORECASE)
+
+
+def _is_purchasable_item(name: str) -> bool:
+    return not _NON_ITEM_LINE.search(name.strip()) and not _VOID_ITEM.search(name)
+
+
+def _coerce_gemini_output(data: object) -> RawGeminiOutput:
+    if not isinstance(data, dict):
+        raise ValueError("Gemini output must be a JSON object.")
+
+    payload = dict(data)
+    warnings = [
+        warning for warning in payload.get("warnings", [])
+        if isinstance(warning, str)
+    ] if isinstance(payload.get("warnings", []), list) else []
+    items = payload.get("items", [])
+    if not isinstance(items, list):
+        items = []
+        warnings.append("Gemini returned an invalid items list.")
+
+    clean_items = []
+    for index, item in enumerate(items, start=1):
+        item_data = dict(item) if isinstance(item, dict) else {}
+        name = item_data.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = f"Unreadable item {index}"
+            warnings.append(f"Item {index} had no readable name.")
+
+        try:
+            qty = float(item_data.get("qty", 1))
+            if not math.isfinite(qty) or qty <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            qty = 1.0
+            warnings.append(f"Item '{name}' had an invalid quantity; using 1.")
+
+        clean_item = {"name": name.strip(), "qty": qty}
+        for field in ("unit_price", "item_total"):
+            raw_amount = item_data.get(field)
+            amount = parse_currency_amount(raw_amount)
+            if raw_amount is not None and amount is None:
+                warnings.append(f"Item '{name}' has an unreadable {field.replace('_', ' ')}.")
+            clean_item[field] = amount
+
+        try:
+            confidence = float(item_data.get("confidence", 0.8))
+            if not math.isfinite(confidence):
+                raise ValueError
+            clean_item["confidence"] = min(1.0, max(0.0, confidence))
+        except (TypeError, ValueError):
+            clean_item["confidence"] = 0.3
+            warnings.append(f"Item '{name}' has an invalid confidence score.")
+        clean_items.append(clean_item)
+
+    payload["items"] = clean_items
+    payload["warnings"] = warnings
+    for field in (
+        "subtotal",
+        "gst_amount",
+        "discount_amount",
+        "service_charge",
+        "other_charges",
+        "round_off",
+        "grand_total",
+    ):
+        raw_amount = payload.get(field)
+        amount = parse_currency_amount(raw_amount)
+        if raw_amount is not None and amount is None:
+            warnings.append(f"Gemini returned an unreadable {field.replace('_', ' ')}.")
+        payload[field] = amount
+
+    if not isinstance(payload.get("currency"), str):
+        payload["currency"] = "UNKNOWN"
+    try:
+        confidence = float(payload.get("overall_confidence", 0.5))
+        if not math.isfinite(confidence):
+            raise ValueError
+        payload["overall_confidence"] = min(1.0, max(0.0, confidence))
+    except (TypeError, ValueError):
+        payload["overall_confidence"] = 0.3
+        warnings.append("Gemini returned an invalid overall confidence score.")
+
+    return RawGeminiOutput.model_validate(payload)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,11 +331,26 @@ def _error_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def _is_timeout_exception(exc: Exception) -> bool:
+    exception_type = type(exc)
+    type_name = exception_type.__name__.lower()
+    module_name = exception_type.__module__.lower()
+    return (
+        isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+        or (
+            "timeout" in type_name
+            and (module_name.startswith("httpx") or module_name.startswith("httpcore"))
+        )
+    )
+
+
 def _is_retryable(exc: Exception) -> bool:
-    """Return True only for transient errors (429 rate-limit, 503 unavailable)."""
+    """Return True for rate limits, server errors, and request timeouts."""
     code = _error_status_code(exc)
     if code is not None:
-        return code in _RETRYABLE_STATUS_CODES
+        return code in _RETRYABLE_STATUS_CODES or 500 <= code <= 599
+    if _is_timeout_exception(exc):
+        return True
     # ServerError subclass is always 5xx — retry those too
     if _GENAI_AVAILABLE and isinstance(exc, genai_errors.ServerError):
         return True
@@ -261,48 +412,37 @@ async def _call_gemini_with_retry(
             # 404 — model not found: permanent, with a helpful message
             if code == 404:
                 logger.error("Gemini model '%s' not found (404)", model)
-                raise RuntimeError(_build_model_not_found_message(model, exc)) from exc
+                raise GeminiAPIError(
+                    404,
+                    _build_model_not_found_message(model, exc),
+                ) from exc
 
-            # 429 — rate limit: retryable
+            # Rate limits and transient gateway/server errors are retryable.
             if _is_retryable(exc):
                 last_exc = exc
                 if attempt < MAX_ATTEMPTS:
                     wait = min(INITIAL_BACKOFF_SEC * (2 ** (attempt - 1)), MAX_BACKOFF_SEC)
                     logger.warning(
-                        "Gemini rate-limited (429) on attempt %d/%d. "
-                        "Retrying in %.1f s…",
-                        attempt, MAX_ATTEMPTS, wait,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                else:
-                    logger.error("Gemini rate-limited (429) — all %d attempts exhausted", MAX_ATTEMPTS)
-                    break
-
-            # Other 4xx (400, 401, 403) — permanent, do not retry
-            logger.error("Gemini client error (code=%s): %s", code, exc)
-            raise
-
-        except genai_errors.ServerError as exc:
-            code = _error_status_code(exc)
-
-            # 503 — service unavailable: retryable
-            if _is_retryable(exc):
-                last_exc = exc
-                if attempt < MAX_ATTEMPTS:
-                    wait = min(INITIAL_BACKOFF_SEC * (2 ** (attempt - 1)), MAX_BACKOFF_SEC)
-                    logger.warning(
-                        "Gemini server error (code=%s) on attempt %d/%d. "
+                        "Gemini transient client error (code=%s) on attempt %d/%d. "
                         "Retrying in %.1f s…",
                         code, attempt, MAX_ATTEMPTS, wait,
                     )
                     await asyncio.sleep(wait)
                     continue
                 else:
-                    logger.error("Gemini server error (code=%s) — all %d attempts exhausted", code, MAX_ATTEMPTS)
+                    logger.error(
+                        "Gemini transient client error (code=%s) — all %d attempts exhausted",
+                        code,
+                        MAX_ATTEMPTS,
+                    )
                     break
 
-            # Other 5xx — also retryable
+            logger.error("Gemini client error (code=%s): %s", code, exc)
+            raise GeminiAPIError(code, str(exc)) from exc
+
+        except genai_errors.ServerError as exc:
+            code = _error_status_code(exc)
+
             last_exc = exc
             if attempt < MAX_ATTEMPTS:
                 wait = min(INITIAL_BACKOFF_SEC * (2 ** (attempt - 1)), MAX_BACKOFF_SEC)
@@ -315,16 +455,29 @@ async def _call_gemini_with_retry(
             break
 
         except Exception as exc:
-            # Unexpected error — don't retry, surface immediately
+            if _is_retryable(exc):
+                last_exc = exc
+                if attempt < MAX_ATTEMPTS:
+                    wait = min(INITIAL_BACKOFF_SEC * (2 ** (attempt - 1)), MAX_BACKOFF_SEC)
+                    logger.warning(
+                        "Gemini request timed out on attempt %d/%d. Retrying in %.1f s…",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                break
+
             logger.error("Unexpected Gemini error: %s", exc)
-            raise
+            raise GeminiAPIError(_error_status_code(exc), str(exc)) from exc
 
     # All retries exhausted
     code = _error_status_code(last_exc) if last_exc else "unknown"
-    raise RuntimeError(
-        f"Gemini Vision API is temporarily unavailable after {MAX_ATTEMPTS} attempts "
-        f"(last error: HTTP {code}). This is usually caused by high demand or "
-        f"rate limiting. Please wait a moment and try again."
+    raise GeminiAPIError(
+        code if isinstance(code, int) else 503,
+        f"Gemini Vision request failed after {MAX_ATTEMPTS} attempts "
+        f"(last upstream status: {code}).",
     ) from last_exc
 
 
@@ -363,7 +516,10 @@ async def extract_bill_items(
             "Add it to backend/.env and restart the server."
         )
 
-    model = _model_name()
+    try:
+        model = _model_name()
+    except RuntimeError as exc:
+        raise GeminiAPIError(503, str(exc)) from exc
 
     client = genai.Client(api_key=api_key)
 
@@ -372,11 +528,19 @@ async def extract_bill_items(
         mime_type=mime_type,
     )
 
+    thinking_config = None
+    if model.startswith("gemini-2.5"):
+        thinking_config = genai_types.ThinkingConfig(thinking_budget=_THINKING_BUDGET)
+    elif model.startswith("gemini-3"):
+        thinking_config = genai_types.ThinkingConfig(thinking_level="low")
+
     config = genai_types.GenerateContentConfig(
         system_instruction=_SYSTEM_PROMPT,
         response_mime_type="application/json",
+        response_schema=RawGeminiOutput,
         temperature=0.1,
-        max_output_tokens=4096,
+        max_output_tokens=_MAX_OUTPUT_TOKENS,
+        thinking_config=thinking_config,
         # Request-level timeout
         http_options=genai_types.HttpOptions(timeout=int(_GEMINI_TIMEOUT_SEC * 1000)),
     )
@@ -392,12 +556,39 @@ async def extract_bill_items(
     # ── Call with retry ────────────────────────────────────────────────────────
     response = await _call_gemini_with_retry(client, model, image_part, config)
 
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    block_reason = getattr(prompt_feedback, "block_reason", None)
+    block_name = getattr(block_reason, "name", str(block_reason)).upper()
+    if block_reason is not None and "SAFETY" in block_name:
+        raise GeminiOutputError(
+            "SAFETY",
+            "Gemini blocked this image under its safety rules. Try another bill image.",
+        )
+
+    candidates = getattr(response, "candidates", None) or []
+    if not candidates:
+        raise GeminiOutputError(
+            "EMPTY_OUTPUT",
+            "Gemini returned no candidates and no readable bill data.",
+        )
+    finish_reason = getattr(candidates[0], "finish_reason", None)
+    finish_name = getattr(finish_reason, "name", str(finish_reason)).upper()
+    if "MAX_TOKENS" in finish_name:
+        raise GeminiOutputError(
+            "MAX_TOKENS",
+            "Gemini's bill response exceeded its output-token limit. Try a clearer or more tightly cropped image.",
+        )
+    if "SAFETY" in finish_name:
+        raise GeminiOutputError(
+            "SAFETY",
+            "Gemini blocked this image under its safety rules. Try another bill image.",
+        )
+
     raw_text = (response.text or "").strip()
     if not raw_text:
-        raise ValueError(
-            "Gemini returned an empty response. "
-            "The image may be too dark, blurry, or cropped. "
-            "Please retake the photo and try again."
+        raise GeminiOutputError(
+            "EMPTY_OUTPUT",
+            "Gemini returned an empty response. Check that the bill is visible and try again.",
         )
 
     logger.debug("Gemini raw response length: %d chars", len(raw_text))
@@ -415,7 +606,7 @@ async def extract_bill_items(
 
     # ── Validate against Pydantic model ───────────────────────────────────────
     try:
-        result = RawGeminiOutput.model_validate(data)
+        result = _coerce_gemini_output(data)
     except Exception as exc:
         logger.error("Pydantic validation of Gemini output failed: %s", exc)
         raise ValueError(
@@ -444,15 +635,24 @@ def build_extracted_items(raw: RawGeminiOutput) -> list[dict]:
     """
     result = []
     for raw_item in raw.items:
-        qty = max(int(round(raw_item.qty)), 1)
-        up_paise, lt_paise = _item_to_paise(raw_item)
+        if not _is_purchasable_item(raw_item.name):
+            continue
+
+        unit_price_paise, line_total_paise, inferred = _item_to_paise(raw_item)
+        warnings = []
+        confidence = raw_item.confidence
+        if raw_item.unit_price is None and raw_item.item_total is None:
+            warnings.append(f"Item '{raw_item.name}' price unreadable.")
+            confidence = min(confidence, 0.3)
 
         result.append({
             "id": f"ocr_{uuid.uuid4().hex[:8]}",
             "name": raw_item.name.strip(),
-            "qty": qty,
-            "unit_price_paise": up_paise,
-            "line_total_paise": lt_paise,
-            "confidence": raw_item.confidence,
+            "qty": raw_item.qty,
+            "unit_price_paise": unit_price_paise,
+            "line_total_paise": line_total_paise,
+            "unit_price_inferred": inferred,
+            "confidence": confidence,
+            "gemini_warnings": warnings,
         })
     return result

@@ -47,7 +47,7 @@ export interface BillItem {
   qty: number;
   /** Unit price in PAISE (integer). Primary storage. */
   unitPricePaise: number;
-  /** Canonical line total in paise, derived from unitPricePaise × qty. */
+  /** Canonical line total in paise; OCR preserves the printed line total. */
   lineTotalPaise: number;
   /**
    * Unit price in rupees (float convenience accessor).
@@ -88,6 +88,8 @@ export interface CanonicalBill {
   detectedSubtotal: number | null;
   /** Currency code detected from the bill. Defaults to "INR". */
   detectedCurrency: string;
+  /** True when OCR detected a different currency than the requested hint. */
+  currencyMismatch?: boolean;
   /** True when items were populated from demo data, not real OCR. */
   isDemoData: boolean;
 
@@ -101,6 +103,10 @@ export interface CanonicalBill {
   detectedDiscountPaise?: number | null;
   /** Service charge / tip printed on the bill, in paise. */
   detectedServiceChargePaise?: number | null;
+  /** Packaging, delivery, and other bill-level charges, in paise. */
+  detectedOtherChargesPaise?: number | null;
+  /** Printed bill rounding adjustment, in paise. */
+  detectedRoundOffPaise?: number | null;
   /** Grand total printed on the bill, in paise. */
   detectedGrandTotalPaise?: number | null;
   /** Subtotal computed by the backend from extracted items, in paise. */
@@ -202,7 +208,7 @@ export function buildDemoBill(imageUri?: string): ExtractedBill {
 
 /** Compute subtotal in PAISE from an array of BillItems. */
 export function computeSubtotalPaise(items: BillItem[]): number {
-  return sumPaise(items.map(i => lineTotalPaise(i.unitPricePaise, i.qty)));
+  return sumPaise(items.map(i => i.lineTotalPaise));
 }
 
 /**

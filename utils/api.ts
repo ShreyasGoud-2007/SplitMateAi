@@ -6,8 +6,12 @@
  * Uploads images via multipart/form-data.  React Native's fetch polyfill
  * handles the boundary automatically — never set Content-Type manually.
  *
- * The Gemini API key stays on the backend and is NEVER sent to the client.
+ * OCR provider credentials stay on the backend and are NEVER sent to the client.
  */
+
+import * as ImageManipulator from 'expo-image-manipulator';
+import type { BillCurrency } from '@/types/splitSession';
+import { DEFAULT_CURRENCY } from '@/utils/currency';
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -22,11 +26,13 @@ const API_BASE_URL: string =
 console.log('[api] Module loaded. API_BASE_URL:', API_BASE_URL);
 console.log('[api] EXPO_PUBLIC_API_BASE_URL env value:', process.env.EXPO_PUBLIC_API_BASE_URL ?? '(undefined)');
 
-/** OCR requests can take up to 2 minutes (Gemini Vision + retries). */
-const OCR_TIMEOUT_MS = 120_000;
+/** Must exceed the backend's 100-second processing deadline. */
+const OCR_TIMEOUT_MS = 130_000;
 
 /** Health-check timeout. */
 const HEALTH_TIMEOUT_MS = 5_000;
+const MAX_UPLOAD_EDGE = 2_000;
+const JPEG_QUALITY = 0.8;
 
 // ── Types (mirror the FastAPI Pydantic response schema exactly) ───────────────
 
@@ -36,6 +42,7 @@ export interface OCRItem {
   qty: number;
   unit_price_paise: number;
   line_total_paise: number;
+  unit_price_inferred?: boolean;
   confidence: number;
 }
 
@@ -50,6 +57,13 @@ export interface OCRValidationWarning {
 export interface OCRExtractResponse {
   success: boolean;
   is_demo_data: boolean;
+  ocr_provider: 'gemini' | 'paddleocr';
+  ocr_text: string | null;
+  ocr_regions: {
+    text: string;
+    confidence: number | null;
+    bbox: number[][];
+  }[];
   restaurant_name: string | null;
   detected_currency: string;
   currency_mismatch: boolean;
@@ -58,12 +72,15 @@ export interface OCRExtractResponse {
   detected_gst_paise: number | null;
   detected_discount_paise: number | null;
   detected_service_charge_paise: number | null;
+  detected_other_charges_paise: number | null;
+  detected_round_off_paise: number | null;
   detected_grand_total_paise: number | null;
   computed_subtotal_paise: number;
   computed_grand_total_paise: number;
   validation_warnings: OCRValidationWarning[];
   has_mismatch: boolean;
   overall_confidence: number;
+  provider_warnings: string[];
   gemini_warnings: string[];
   message: string;
 }
@@ -124,7 +141,7 @@ export function resolveFileName(
 // ── Main upload function ───────────────────────────────────────────────────────
 
 /**
- * Upload a bill image to the backend for Gemini Vision OCR extraction.
+ * Upload a bill image to the backend for the configured OCR provider.
  *
  * @param imageUri   Local `file://` URI from expo-image-picker.
  * @param mimeType   MIME type from ImagePickerAsset.mimeType (preferred).
@@ -133,23 +150,26 @@ export function resolveFileName(
  * @returns   Parsed OCR response with items, totals, and validation warnings.
  * @throws    OCRError for all failure modes — network, timeout, HTTP errors.
  *
- * Security: The Gemini API key is never sent to or stored on the client.
+ * Security: OCR provider credentials are never sent to or stored on the client.
  */
 export async function extractBill(
   imageUri: string,
   mimeType?: string,
   fileName?: string,
+  hintCurrency: BillCurrency = DEFAULT_CURRENCY,
 ): Promise<OCRExtractResponse> {
 
   if (!imageUri || !imageUri.trim()) {
     throw new OCRError('Image URI is empty. Please select an image first.', 'INVALID_URI');
   }
 
-  const resolvedMime = resolveMimeType(mimeType, imageUri);
-  const resolvedName = resolveFileName(fileName, resolvedMime);
+  const resolvedMime = 'image/jpeg';
+  const baseName = fileName?.trim().replace(/\.[^.]+$/, '') || 'bill';
+  const resolvedName = resolveFileName(`${baseName}.jpg`, resolvedMime);
+  const uploadUri = await prepareImageForUpload(imageUri);
 
   // Safe log — URI prefix only, no content, no key
-  console.log('[api] extractBill: URI prefix:', imageUri.slice(0, 60));
+  console.log('[api] extractBill: URI prefix:', uploadUri.slice(0, 60));
   console.log('[api] extractBill: mimeType:', resolvedMime, '| fileName:', resolvedName);
   console.log('[api] extractBill: endpoint:', `${API_BASE_URL}/api/ocr/extract`);
 
@@ -160,15 +180,15 @@ export async function extractBill(
   // causing FastAPI to reject the upload with 422 "No multipart boundary".
   const formData = new FormData();
   formData.append('file', {
-    uri:  imageUri,
+    uri:  uploadUri,
     type: resolvedMime,
     name: resolvedName,
   } as any);
-  formData.append('hint_currency', 'INR');
+  formData.append('hint_currency', hintCurrency);
 
   // Confirm FormData fields — field name must be 'file' to match FastAPI endpoint
-  console.log('[api] FormData fields: file (uri/type/name) + hint_currency=INR');
-  console.log('[api] FormData file.uri (first 80):', imageUri.slice(0, 80));
+  console.log('[api] FormData fields: file (uri/type/name) + hint_currency:', hintCurrency);
+  console.log('[api] FormData file.uri (first 80):', uploadUri.slice(0, 80));
   console.log('[api] FormData file.type:', resolvedMime);
   console.log('[api] FormData file.name:', resolvedName);
 
@@ -222,15 +242,9 @@ export async function extractBill(
           );
         case 503:
           throw new OCRError(
-            detail || 'Gemini AI is temporarily overloaded. Please wait a moment and try again.',
-            'GEMINI_UNAVAILABLE',
+            detail || 'The selected OCR provider is temporarily unavailable. Please try again.',
+            'OCR_PROVIDER_UNAVAILABLE',
             503,
-          );
-        case 504:
-          throw new OCRError(
-            'Gemini did not respond in time. Please try again.',
-            'GEMINI_UNAVAILABLE',
-            504,
           );
         case 404:
           throw new OCRError(
@@ -286,7 +300,7 @@ export async function extractBill(
     console.log('[api] OCR success — detected_currency:', ocr.detected_currency);
     console.log('[api] OCR success — has_mismatch:', ocr.has_mismatch);
     if (ocr.gemini_warnings.length > 0) {
-      console.warn('[api] Gemini warnings:', ocr.gemini_warnings);
+      console.warn('[api] OCR warnings:', ocr.gemini_warnings);
     }
     return ocr;
 
@@ -304,7 +318,7 @@ export async function extractBill(
     ) {
       console.error('[api] extractBill: request aborted (timeout)');
       throw new OCRError(
-        'Request timed out after 2 minutes. The server may be processing a large image. Please try again.',
+        'Request timed out after 130 seconds. Please retry.',
         'TIMEOUT',
       );
     }
@@ -328,6 +342,19 @@ export async function extractBill(
       'UNKNOWN',
     );
   }
+}
+
+async function prepareImageForUpload(imageUri: string): Promise<string> {
+  const context = ImageManipulator.ImageManipulator.manipulate(imageUri, {
+    maxWidth: MAX_UPLOAD_EDGE,
+    maxHeight: MAX_UPLOAD_EDGE,
+  });
+  const renderedImage = await context.renderAsync();
+  const result = await renderedImage.saveAsync({
+    format: ImageManipulator.SaveFormat.JPEG,
+    compress: JPEG_QUALITY,
+  });
+  return result.uri;
 }
 
 // ── Health check ──────────────────────────────────────────────────────────────

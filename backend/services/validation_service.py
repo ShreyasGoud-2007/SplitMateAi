@@ -12,6 +12,8 @@ Principles:
 from __future__ import annotations
 
 import logging
+import math
+from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,11 @@ MISMATCH_TOLERANCE_PAISE: int = 50
 # ─────────────────────────────────────────────────────────────────────────────
 
 def rupees_to_paise(rupees: float) -> int:
-    return round(rupees * 100)
+    return int(
+        (Decimal(str(rupees)) * 100).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
 
 def apply_rate(paise: int, rate: float) -> int:
     return round(paise * rate)
@@ -40,8 +46,30 @@ def compute_grand_total(
     gst_paise: int,
     service_charge_paise: int,
     discount_paise: int,
+    other_charges_paise: int = 0,
+    round_off_paise: int = 0,
 ) -> int:
-    return subtotal_paise + gst_paise + service_charge_paise - discount_paise
+    return (
+        subtotal_paise
+        + gst_paise
+        + service_charge_paise
+        + other_charges_paise
+        + round_off_paise
+        - discount_paise
+    )
+
+
+def _currency_symbol(currency: str) -> str:
+    return {
+        "INR": "₹",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+    }.get(currency.upper(), f"{currency.upper()} ")
+
+
+def _format_money(paise: int, currency: str) -> str:
+    return f"{_currency_symbol(currency)}{paise / 100:.2f}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +114,8 @@ class ValidationWarning:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def validate_item_totals(
-    items: list[dict],  # list of dicts with keys: id, name, qty, unit_price_paise, line_total_paise
+    items: list[dict],
+    currency: str = "INR",
 ) -> List[ValidationWarning]:
     """
     For every item, verify that qty × unit_price_paise == line_total_paise.
@@ -95,16 +124,21 @@ def validate_item_totals(
     warnings: List[ValidationWarning] = []
 
     for item in items:
-        expected = item["qty"] * item["unit_price_paise"]
+        expected = int(
+            (Decimal(str(item["qty"])) * item["unit_price_paise"]).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+        )
         actual   = item["line_total_paise"]
-        if abs(expected - actual) > 0:   # any difference at all — paise is exact
+        tolerance = max(1, math.ceil(item["qty"])) if item.get("unit_price_inferred") else 1
+        if abs(expected - actual) > tolerance:
             warnings.append(ValidationWarning(
                 code="ITEM_TOTAL_MISMATCH",
                 message=(
                     f"Item '{item['name']}': "
-                    f"{item['qty']} × ₹{item['unit_price_paise']/100:.2f} "
-                    f"= ₹{expected/100:.2f} "
-                    f"but bill shows ₹{actual/100:.2f}."
+                    f"{item['qty']} × {_format_money(item['unit_price_paise'], currency)} "
+                    f"= {_format_money(expected, currency)} "
+                    f"but bill shows {_format_money(actual, currency)}."
                 ),
                 expected_paise=expected,
                 actual_paise=actual,
@@ -120,6 +154,7 @@ def validate_item_totals(
 def validate_subtotal(
     computed_subtotal_paise: int,
     detected_subtotal_paise: Optional[int],
+    currency: str = "INR",
 ) -> List[ValidationWarning]:
     """
     Compare the sum of item line totals against the printed subtotal.
@@ -136,9 +171,9 @@ def validate_subtotal(
     return [ValidationWarning(
         code="SUBTOTAL_MISMATCH",
         message=(
-            f"Computed subtotal (₹{computed_subtotal_paise/100:.2f}) is "
-            f"₹{diff/100:.2f} {direction} the printed subtotal "
-            f"(₹{detected_subtotal_paise/100:.2f}). "
+            f"Computed subtotal ({_format_money(computed_subtotal_paise, currency)}) is "
+            f"{_format_money(diff, currency)} {direction} the printed subtotal "
+            f"({_format_money(detected_subtotal_paise, currency)}). "
             "Review and edit items if needed."
         ),
         expected_paise=detected_subtotal_paise,
@@ -149,6 +184,8 @@ def validate_subtotal(
 def validate_grand_total(
     computed_grand_total_paise: int,
     detected_grand_total_paise: Optional[int],
+    currency: str = "INR",
+    subtotal_source: str = "computed items subtotal",
 ) -> List[ValidationWarning]:
     """
     Compare the calculated grand total against the printed grand total.
@@ -164,9 +201,10 @@ def validate_grand_total(
     return [ValidationWarning(
         code="GRAND_TOTAL_MISMATCH",
         message=(
-            f"Calculated grand total (₹{computed_grand_total_paise/100:.2f}) is "
-            f"₹{diff/100:.2f} {direction} the printed grand total "
-            f"(₹{detected_grand_total_paise/100:.2f})."
+            f"Grand total using {subtotal_source} "
+            f"({_format_money(computed_grand_total_paise, currency)}) is "
+            f"{_format_money(diff, currency)} {direction} the printed grand total "
+            f"({_format_money(detected_grand_total_paise, currency)})."
         ),
         expected_paise=detected_grand_total_paise,
         actual_paise=computed_grand_total_paise,
@@ -200,12 +238,15 @@ def validate_bill(
     detected_discount_paise: Optional[int],
     detected_service_charge_paise: Optional[int],
     detected_grand_total_paise: Optional[int],
+    detected_other_charges_paise: Optional[int] = None,
+    detected_round_off_paise: Optional[int] = None,
+    currency: str = "INR",
 ) -> BillValidationResult:
     """
     Run all validation checks:
-      1. qty × unit_price == line_total for every item
+      1. qty × unit_price agrees with line_total for every item
       2. sum(line_totals) == printed subtotal
-      3. subtotal + gst + service_charge - discount == printed grand total
+      3. computed and detected subtotals agree with printed grand total
 
     Never modifies the input values.
     Returns a BillValidationResult with all warnings and computed totals.
@@ -213,7 +254,7 @@ def validate_bill(
     result = BillValidationResult()
 
     # 1. Item-level checks
-    item_warnings = validate_item_totals(items)
+    item_warnings = validate_item_totals(items, currency)
     result.warnings.extend(item_warnings)
 
     # 2. Computed subtotal
@@ -221,21 +262,46 @@ def validate_bill(
     computed_sub = compute_subtotal(line_totals)
     result.computed_subtotal_paise = computed_sub
 
-    sub_warnings = validate_subtotal(computed_sub, detected_subtotal_paise)
+    sub_warnings = validate_subtotal(computed_sub, detected_subtotal_paise, currency)
     result.warnings.extend(sub_warnings)
 
-    # 3. Computed grand total
-    # Use detected values when available; otherwise fall back to computed subtotal + 0 for unknowns.
-    sub_for_total  = detected_subtotal_paise if detected_subtotal_paise is not None else computed_sub
-    gst            = detected_gst_paise            or 0
-    service        = detected_service_charge_paise or 0
-    discount       = detected_discount_paise       or 0
-
-    computed_total = compute_grand_total(sub_for_total, gst, service, discount)
+    # 3. Compare the printed total against both possible subtotal sources.
+    gst = detected_gst_paise or 0
+    service = detected_service_charge_paise or 0
+    discount = detected_discount_paise or 0
+    other_charges = detected_other_charges_paise or 0
+    round_off = detected_round_off_paise or 0
+    computed_total = compute_grand_total(
+        computed_sub, gst, service, discount, other_charges, round_off
+    )
     result.computed_grand_total_paise = computed_total
+    result.warnings.extend(
+        validate_grand_total(
+            computed_total,
+            detected_grand_total_paise,
+            currency,
+            "computed items subtotal",
+        )
+    )
 
-    total_warnings = validate_grand_total(computed_total, detected_grand_total_paise)
-    result.warnings.extend(total_warnings)
+    if detected_subtotal_paise is not None and detected_subtotal_paise != computed_sub:
+        detected_subtotal_total = compute_grand_total(
+            detected_subtotal_paise,
+            gst,
+            service,
+            discount,
+            other_charges,
+            round_off,
+        )
+        detected_total_warnings = validate_grand_total(
+            detected_subtotal_total,
+            detected_grand_total_paise,
+            currency,
+            "detected subtotal",
+        )
+        for warning in detected_total_warnings:
+            warning.code = "GRAND_TOTAL_MISMATCH_DETECTED_SUBTOTAL"
+        result.warnings.extend(detected_total_warnings)
 
     if result.has_mismatch:
         logger.warning(

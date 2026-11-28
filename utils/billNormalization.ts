@@ -14,16 +14,24 @@ export type BillNormalizationInput = Omit<Partial<CanonicalBill>, 'items' | 'cur
   items: (Partial<BillItem> & Pick<BillItem, 'name' | 'qty' | 'unitPricePaise'>)[];
 };
 
-function isNonNegativeSafeInteger(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= 0;
-}
-
-function normalizeOptionalAmount(value: number | null | undefined, field: string): number | null {
+function normalizeOptionalAmount(
+  value: number | null | undefined,
+  field: string,
+  warnings: string[],
+): number | null {
   if (value === null || value === undefined) return null;
-  if (!isNonNegativeSafeInteger(value)) {
-    throw new Error(`${field} must be a non-negative integer number of paise.`);
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    warnings.push(`${field} was invalid and has been set to 0 paise.`);
+    return 0;
   }
-  return value;
+  const absolute = Math.abs(numeric);
+  const normalized = Math.min(Number.MAX_SAFE_INTEGER, Math.round(absolute));
+  if (numeric < 0) warnings.push(`${field} was negative and has been normalized to its absolute value.`);
+  if (!Number.isSafeInteger(numeric) || normalized !== numeric) {
+    warnings.push(`${field} was not a safe integer amount of paise and has been rounded.`);
+  }
+  return normalized;
 }
 
 function normalizeCurrency(value: string | undefined): BillCurrency {
@@ -49,24 +57,23 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
     if (!Number.isFinite(item.qty) || item.qty <= 0 || item.qty > 100_000) {
       throw new Error(`Quantity for "${name}" must be greater than zero.`);
     }
-    if (!Number.isSafeInteger(item.unitPricePaise) || item.unitPricePaise < 0) {
-      throw new Error(`Unit price for "${name}" must be a non-negative integer number of paise.`);
-    }
-
-    const calculatedLineTotal = Math.round(item.unitPricePaise * item.qty);
+    const unitPricePaise = normalizeOptionalAmount(
+      item.unitPricePaise,
+      `Unit price for "${name}"`,
+      validationWarnings,
+    ) ?? 0;
+    const calculatedLineTotal = Math.round(unitPricePaise * item.qty);
     if (!Number.isSafeInteger(calculatedLineTotal)) {
       throw new Error(`Line total for "${name}" is outside the supported range.`);
     }
-    if (
-      item.lineTotalPaise !== undefined &&
-      (!Number.isSafeInteger(item.lineTotalPaise) || item.lineTotalPaise < 0)
-    ) {
-      throw new Error(`Line total for "${name}" must be a non-negative integer number of paise.`);
-    }
-    if (item.lineTotalPaise !== undefined && item.lineTotalPaise !== calculatedLineTotal) {
-      validationWarnings.push(
-        `Line total for "${name}" was normalized from unit price × quantity.`,
-      );
+    const providedLineTotal = normalizeOptionalAmount(
+      item.lineTotalPaise,
+      `Line total for "${name}"`,
+      validationWarnings,
+    );
+    const lineTotalPaise = providedLineTotal ?? calculatedLineTotal;
+    if (providedLineTotal !== null && providedLineTotal !== calculatedLineTotal) {
+      validationWarnings.push(`Printed line total for "${name}" was preserved for review.`);
     }
 
     const id = typeof item.id === 'string' && item.id.trim() ? item.id.trim() : createId();
@@ -77,9 +84,9 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
       id,
       name,
       qty: item.qty,
-      unitPricePaise: item.unitPricePaise,
-      lineTotalPaise: calculatedLineTotal,
-      unitPrice: item.unitPricePaise / 100,
+      unitPricePaise,
+      lineTotalPaise,
+      unitPrice: unitPricePaise / 100,
       confidence:
         typeof item.confidence === 'number' && Number.isFinite(item.confidence)
           ? Math.min(1, Math.max(0, item.confidence))
@@ -91,31 +98,47 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
   if (!Number.isSafeInteger(subtotalPaise)) {
     throw new Error('Bill subtotal is outside the supported range.');
   }
-  const declaredSubtotal = normalizeOptionalAmount(input.subtotalPaise, 'Bill subtotal');
-  if (declaredSubtotal !== null && Math.abs(declaredSubtotal - subtotalPaise) > 1) {
-    validationWarnings.push('Provided subtotal differs from the normalized item subtotal.');
-  }
-
   const detectedSubtotalPaise = normalizeOptionalAmount(
     input.detectedSubtotalPaise,
     'Detected subtotal',
+    validationWarnings,
   );
-  const detectedGstPaise = normalizeOptionalAmount(input.detectedGstPaise, 'Detected GST');
-  const detectedDiscountPaise = normalizeOptionalAmount(input.detectedDiscountPaise, 'Detected discount');
+  const detectedGstPaise = normalizeOptionalAmount(
+    input.detectedGstPaise,
+    'Detected GST',
+    validationWarnings,
+  );
+  const detectedDiscountPaise = normalizeOptionalAmount(
+    input.detectedDiscountPaise,
+    'Detected discount',
+    validationWarnings,
+  );
   const detectedServiceChargePaise = normalizeOptionalAmount(
     input.detectedServiceChargePaise,
     'Detected service charge',
+    validationWarnings,
+  );
+  const detectedOtherChargesPaise = normalizeOptionalAmount(
+    input.detectedOtherChargesPaise,
+    'Detected other charges',
+    validationWarnings,
+  );
+  const detectedRoundOffPaise = normalizeOptionalAmount(
+    input.detectedRoundOffPaise,
+    'Detected round-off',
+    validationWarnings,
   );
   const detectedGrandTotalPaise = normalizeOptionalAmount(
     input.detectedGrandTotalPaise,
     'Detected grand total',
+    validationWarnings,
   );
 
   if (detectedSubtotalPaise !== null && Math.abs(detectedSubtotalPaise - subtotalPaise) > 1) {
     validationWarnings.push('Detected subtotal differs from the normalized item subtotal.');
   }
 
-  const explicitTaxPaise = normalizeOptionalAmount(input.taxPaise, 'Tax');
+  const explicitTaxPaise = normalizeOptionalAmount(input.taxPaise, 'Tax', validationWarnings);
   const taxIsEstimated =
     input.metadata?.taxIsEstimated ??
     (detectedGstPaise === null && explicitTaxPaise === null);
@@ -123,25 +146,17 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
   const taxPaise = detectedGstPaise
     ?? (taxIsEstimated ? estimatedTaxPaise : explicitTaxPaise ?? estimatedTaxPaise);
   const serviceChargePaise = detectedServiceChargePaise ?? 0;
+  const otherChargesPaise = detectedOtherChargesPaise ?? 0;
+  const roundOffPaise = detectedRoundOffPaise ?? 0;
   const discountPaise = detectedDiscountPaise ?? 0;
   const calculatedTotalPaise = Math.max(
     0,
-    subtotalPaise + taxPaise + serviceChargePaise - discountPaise,
+    subtotalPaise + taxPaise + serviceChargePaise + otherChargesPaise + roundOffPaise - discountPaise,
   );
   if (!Number.isSafeInteger(calculatedTotalPaise)) {
     throw new Error('Calculated bill total is outside the supported range.');
   }
-  const totalPaise = detectedGrandTotalPaise ?? calculatedTotalPaise;
-
-  if (!Number.isSafeInteger(totalPaise)) throw new Error('Bill total is outside the supported range.');
-  const declaredTotal = normalizeOptionalAmount(input.totalPaise, 'Bill total');
-  if (
-    declaredTotal !== null &&
-    detectedGrandTotalPaise === null &&
-    Math.abs(declaredTotal - calculatedTotalPaise) > 1
-  ) {
-    validationWarnings.push('Provided bill total differs from the normalized total.');
-  }
+  const totalPaise = calculatedTotalPaise;
   if (
     detectedGrandTotalPaise !== null &&
     Math.abs(detectedGrandTotalPaise - calculatedTotalPaise) > 1
@@ -164,7 +179,7 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
   const metadata: BillMetadata = {
     ...input.metadata,
     taxIsEstimated,
-    validationWarnings,
+    validationWarnings: [...new Set(validationWarnings)],
   };
   const createdAt =
     input.createdAt && !Number.isNaN(Date.parse(input.createdAt))
@@ -190,6 +205,8 @@ export function normalizeBill(input: BillNormalizationInput): CanonicalBill {
     detectedGstPaise,
     detectedDiscountPaise,
     detectedServiceChargePaise,
+    detectedOtherChargesPaise,
+    detectedRoundOffPaise,
     detectedGrandTotalPaise,
     detectedCurrency: input.detectedCurrency ?? normalizeCurrency(input.currency),
     isDemoData: source === 'demo',

@@ -36,9 +36,12 @@ export function adaptOCRResponseToBill(
         ? null
         : response.detected_subtotal_paise / 100,
     detectedCurrency: response.detected_currency,
+    currencyMismatch: response.currency_mismatch,
     detectedGstPaise: response.detected_gst_paise,
     detectedDiscountPaise: response.detected_discount_paise,
     detectedServiceChargePaise: response.detected_service_charge_paise,
+    detectedOtherChargesPaise: response.detected_other_charges_paise,
+    detectedRoundOffPaise: response.detected_round_off_paise,
     detectedGrandTotalPaise: response.detected_grand_total_paise,
     computedSubtotalPaise: response.computed_subtotal_paise,
     computedGrandTotalPaise: response.computed_grand_total_paise,

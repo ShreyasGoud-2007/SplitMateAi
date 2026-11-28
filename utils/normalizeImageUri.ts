@@ -1,77 +1,72 @@
 /**
- * normalizeImageUri.ts
- *
- * On Android, expo-image-picker can return a `content://` URI (Android Content
- * Provider URI) instead of a `file://` URI.  React Native's <Image> component
- * in Expo Go cannot display `content://` URIs directly — it needs a `file://`
- * path.
- *
- * This helper copies picker URIs into the app's local cache using
- * expo-file-system, returning an app-owned `file://` path that both
- * <Image> and the multipart/form-data upload can use reliably.
- *
- * If the URI already starts with `file://` (or is a web `http` URL) it is
- * returned unchanged.
+ * Copy Android picker images into app-owned document storage so the preview
+ * remains available after the system clears temporary cache files.
  */
 
-import * as FileSystem from 'expo-file-system/legacy';
+import { Directory, File, Paths } from 'expo-file-system';
 import { Platform } from 'react-native';
 
+const BILL_IMAGE_DIRECTORY = 'splitmate-bill-images';
+
 /**
- * Copy an image URI from expo-image-picker into the app cache on Android.
+ * Copy an image URI from expo-image-picker into app-owned storage on Android.
  *
  * @param uri       The URI returned by ImagePickerAsset.uri
  * @param mimeType  MIME type (used to pick the right extension)
- * @returns         An app-owned `file://` URI pointing to a copy in the app cache
+ * @returns         A `file://` URI pointing to the durable app-owned copy
  */
 export async function normalizeImageUri(
   uri: string,
   mimeType: string,
 ): Promise<string> {
-  // On iOS and web content:// URIs are not an issue — return as-is
-  if (Platform.OS !== 'android') {
-    console.log('[normalizeUri] Non-Android platform — returning URI unchanged');
-    return uri;
+  if (!uri.trim()) {
+    throw new Error('No bill image was selected. Please choose an image or take a photo.');
   }
 
-  // Avoid copying an image that this helper has already placed in the cache.
-  if (uri.startsWith('file://') && uri.includes('/splitmate_')) {
-    console.log('[normalizeUri] Already in the app image cache — returning unchanged');
-    return uri;
-  }
-
-  // HTTP/HTTPS — not a local picker image, leave it alone.
   if (uri.startsWith('http://') || uri.startsWith('https://')) {
-    console.log('[normalizeUri] Remote URI — returning unchanged');
     return uri;
   }
 
-  // Copy picker URIs, including file:// paths owned by Expo's picker cache.
-  console.log('[normalizeUri] Copying picker URI into app cache, scheme:', uri.split(':')[0]);
-  console.log('[normalizeUri] Copying to local cache…');
-
-  const ext = mimeType === 'image/png' ? '.png'
-            : mimeType === 'image/webp' ? '.webp'
-            : '.jpg';
-
-  const cacheDir = FileSystem.cacheDirectory;
-  if (!cacheDir) {
-    throw new Error('Could not access the app image cache. Please select the bill image again.');
+  if (Platform.OS !== 'android') {
+    return uri;
   }
 
-  const destUri = `${cacheDir}splitmate_${Date.now()}${ext}`;
+  const imageDirectory = new Directory(Paths.document, BILL_IMAGE_DIRECTORY);
+  const imageDirectoryUri = `${imageDirectory.uri.replace(/\/+$/, '')}/`;
 
-  try {
-    await FileSystem.copyAsync({ from: uri, to: destUri });
-    const copiedFile = await FileSystem.getInfoAsync(destUri);
-    if (!copiedFile.exists || copiedFile.size === 0) {
-      throw new Error('The copied image is missing or empty.');
+  if (uri.startsWith(imageDirectoryUri)) {
+    const existingImage = new File(uri);
+    if (!existingImage.exists || existingImage.size <= 0) {
+      throw new Error('The selected bill image is no longer available. Please choose it again or take a new photo.');
     }
-
-    console.log('[normalizeUri] Copied to:', destUri);
-    return destUri;
-  } catch (err) {
-    console.error('[normalizeUri] Copy failed:', err instanceof Error ? err.message : String(err));
-    throw new Error('Could not load the selected bill image. Please choose it again or take a new photo.');
+    return uri;
   }
+
+  const extension = mimeType === 'image/png' ? '.png'
+                  : mimeType === 'image/webp' ? '.webp'
+                  : '.jpg';
+  const sourceImage = new File(uri);
+  const fileName = `splitmate_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${extension}`;
+  const destinationImage = new File(imageDirectory, fileName);
+
+  if (!sourceImage.exists || sourceImage.size <= 0) {
+    throw new Error('The selected image is missing or empty.');
+  }
+
+  imageDirectory.create({ idempotent: true, intermediates: true });
+  try {
+    await sourceImage.copy(destinationImage);
+  } catch (error) {
+    throw new Error(
+      error instanceof Error
+        ? `Could not copy the selected bill image: ${error.message}`
+        : 'Could not copy the selected bill image.',
+    );
+  }
+
+  if (!destinationImage.exists || destinationImage.size <= 0) {
+    throw new Error('The copied image is missing or empty.');
+  }
+
+  return destinationImage.uri;
 }

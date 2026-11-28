@@ -1,8 +1,9 @@
 import LoadingOverlay from '@/components/LoadingOverlay';
 import { Colors } from '@/constants/Colors';
-import { storeDemoBill, storeOCRResult, useBillStore } from '@/store/billStore';
+import { storeOCRResult, useBillStore } from '@/store/billStore';
 import { extractBill, OCRError } from '@/utils/api';
 import { normalizeImageUri } from '@/utils/normalizeImageUri';
+import { createManualBill } from '@/utils/billAdapters';
 import * as ImagePicker from 'expo-image-picker';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -51,35 +52,26 @@ function coerceString(value: string | string[] | undefined): string {
 export default function ReviewScreen() {
   const router = useRouter();
 
-  // Expo Router URL-encodes params; useLocalSearchParams decodes them, but can
-  // return string[] when a key appears multiple times.  Coerce to string.
+  // Metadata still travels in route params, which may be returned as arrays.
   const params = useLocalSearchParams<{
-    uri: string | string[];
     mimeType: string | string[];
     fileName: string | string[];
   }>();
 
-  const uri      = coerceString(params.uri);
   const mimeType = coerceString(params.mimeType) || 'image/jpeg';
   const fileName = coerceString(params.fileName) || 'bill.jpg';
 
-  const { setBill } = useBillStore();
+  const {
+    setBill,
+    getSplitSession,
+    setPendingImageUri,
+    getPendingImageUri,
+  } = useBillStore();
+  const [uri, setUri] = useState(() => getPendingImageUri());
   const [loading, setLoading]           = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [imageErrorUri, setImageErrorUri] = useState<string | null>(null);
   const imageError = imageErrorUri === uri;
-
-  // ── Diagnostic logs — fires only on initial render (state flag trick) ──
-  const [_loggedMount, _setLoggedMount] = useState(false);
-  if (!_loggedMount) {
-    _setLoggedMount(true);
-    console.log('[Review] ──── ReviewScreen mounted ────');
-    console.log('[Review] params.uri type:', typeof params.uri, '| isArray:', Array.isArray(params.uri));
-    console.log('[Review] params.uri raw (first 80):', String(params.uri).slice(0, 80));
-    console.log('[Review] Coerced uri (first 80):', uri.slice(0, 80));
-    console.log('[Review] uri empty?', !uri);
-    console.log('[Review] mimeType:', mimeType, '| fileName:', fileName);
-  }
 
   // ── Guard: no URI ──────────────────────────────────────────────────────────
   if (!uri) {
@@ -125,11 +117,12 @@ export default function ReviewScreen() {
         const asset = result.assets[0];
         const selectedMimeType = asset.mimeType ?? 'image/jpeg';
         const imageUri = await normalizeImageUri(asset.uri, selectedMimeType);
+        setPendingImageUri(imageUri);
+        setUri(imageUri);
         setLoading(false);
         router.replace({
           pathname: '/scan/review',
           params: {
-            uri:      imageUri,
             mimeType: selectedMimeType,
             fileName: asset.fileName ?? 'bill.jpg',
           },
@@ -173,11 +166,12 @@ export default function ReviewScreen() {
         const asset = result.assets[0];
         const selectedMimeType = asset.mimeType ?? 'image/jpeg';
         const imageUri = await normalizeImageUri(asset.uri, selectedMimeType);
+        setPendingImageUri(imageUri);
+        setUri(imageUri);
         setLoading(false);
         router.replace({
           pathname: '/scan/review',
           params: {
-            uri:      imageUri,
             mimeType: selectedMimeType,
             fileName: asset.fileName ?? 'bill.jpg',
           },
@@ -198,65 +192,83 @@ export default function ReviewScreen() {
   async function handleExtract() {
     if (loading) return; // prevent double-tap
 
+    const imageUri = uri;
+    if (!imageUri) {
+      Alert.alert('Image unavailable', 'Choose or capture the bill image again.');
+      return;
+    }
+
     setLoading(true);
     setLoadingMessage('Uploading your bill…');
 
     try {
-      const uploadStart = Date.now();
-      console.log('[Review] ──── Extract Bill Items pressed ────');
-      console.log('[Review] URI (first 80):', uri.slice(0, 80));
-      console.log('[Review] mimeType:', mimeType, '| fileName:', fileName);
-      console.log('[Review] API base URL:', process.env.EXPO_PUBLIC_API_BASE_URL ?? '(env var missing — will fall back to localhost)');
-
-      const result = await extractBill(uri, mimeType, fileName);
-
-      const elapsed = Date.now() - uploadStart;
-      console.log('[Review] OCR succeeded — elapsed:', elapsed, 'ms');
-      console.log('[Review] Items received:', result.items.length);
-      console.log('[Review] overall_confidence:', result.overall_confidence);
-      console.log('[Review] restaurant_name:', result.restaurant_name ?? '(not detected)');
-      console.log('[Review] has_mismatch:', result.has_mismatch);
-      console.log('[Review] gemini_warnings:', result.gemini_warnings);
+      const hintCurrency = getSplitSession()?.currency ?? 'INR';
+      const result = await extractBill(imageUri, mimeType, fileName, hintCurrency);
 
       if (result.items.length === 0) {
-        showDefaultBill('No items could be extracted from this image.');
+        showOCRErrorActions(
+          'No bill items found',
+          'No purchasable items could be extracted from this image.',
+        );
         return;
       }
 
-      setLoadingMessage('Analysing your bill with AI…');
+      setLoadingMessage('Preparing your bill for review…');
 
-      storeOCRResult(setBill, uri, result);
+      storeOCRResult(setBill, imageUri, result);
 
       setLoading(false);
-      router.push({ pathname: '/scan/results', params: { uri } });
+      router.push('/scan/results');
     } catch (err) {
       setLoading(false);
 
-      const error = err as OCRError;
+      const error = err instanceof OCRError
+        ? err
+        : new OCRError(
+            err instanceof Error ? err.message : 'Bill extraction is temporarily unavailable.',
+            'UNKNOWN',
+          );
       console.error('[Review] OCR FAILED — code:', error.code);
       console.error('[Review] OCR FAILED — message:', error.message);
-      console.error('[Review] OCR FAILED — statusCode:', (error as any).statusCode ?? 'n/a');
+      console.error('[Review] OCR FAILED — statusCode:', error.statusCode ?? 'n/a');
       if (err instanceof Error && err.stack) {
         console.error('[Review] OCR FAILED — stack:', err.stack);
       }
 
-      showDefaultBill(error.message || 'Bill extraction is temporarily unavailable.');
+      showOCRErrorActions('Bill extraction failed', error.message);
     }
   }
 
-  function showDefaultBill(reason: string) {
-    storeDemoBill(setBill, uri);
+  function showOCRErrorActions(title: string, message: string) {
     setLoading(false);
     Alert.alert(
-      'Using sample bill',
-      `${reason}\n\nA sample bill is ready so you can continue. These items are examples and were not read from your photo.`,
+      title,
+      `${message}\n\nYou can retry OCR or enter the bill items yourself.`,
       [
         {
-          text: 'Continue',
-          onPress: () => router.push({ pathname: '/scan/results', params: { uri } }),
+          text: 'Retry',
+          onPress: () => { void handleExtract(); },
         },
+        { text: 'Enter items manually', onPress: handleEnterItemsManually },
+        { text: 'Cancel', style: 'cancel' },
       ],
     );
+  }
+
+  function handleEnterItemsManually() {
+    const imageUri = uri;
+    if (!imageUri) {
+      Alert.alert('Image unavailable', 'Choose or capture the bill image again.');
+      return;
+    }
+
+    const bill = createManualBill({
+      items: [],
+      currency: getSplitSession()?.currency ?? 'INR',
+      imageMetadata: { uri: imageUri },
+    });
+    setBill(bill);
+    router.push('/scan/results');
   }
 
   // ── Render ─────────────────────────────────────────────────────────────────
@@ -286,9 +298,9 @@ export default function ReviewScreen() {
         {imageError ? (
           <View style={styles.imageFallback}>
             <ZoomIn size={40} color="rgba(255,255,255,0.4)" strokeWidth={1.5} />
-            <Text style={styles.imageFallbackText}>Unable to load image</Text>
+            <Text style={styles.imageFallbackText}>Image unavailable</Text>
             <Text style={styles.imageFallbackHint}>
-              URI: {uri.slice(0, 50)}{uri.length > 50 ? '…' : ''}
+              Retake the photo or choose another image to continue.
             </Text>
           </View>
         ) : (
@@ -296,28 +308,19 @@ export default function ReviewScreen() {
             source={{ uri }}
             style={styles.billImage}
             resizeMode="contain"
-            onLoadStart={() => {
-              console.log('[Review] Image.onLoadStart uri (first 80):', uri.slice(0, 80));
-            }}
-            onLoad={(e) => {
-              const { width, height } = e.nativeEvent.source;
-              console.log('[Review] Image.onLoad OK — rendered size:', width, 'x', height);
-            }}
-            onError={(e) => {
-              const nativeError = e.nativeEvent.error ?? '(no native error message)';
-              console.error('[Review] Image.onError — nativeError:', nativeError);
-              console.error('[Review] Image.onError — uri type:', typeof uri, '| isArray:', Array.isArray(uri));
-              console.error('[Review] Image.onError — uri (first 80):', String(uri).slice(0, 80));
+            onError={() => {
               setImageErrorUri(uri);
             }}
           />
         )}
 
         {/* Quality indicator pill */}
-        <View style={styles.qualityPill}>
-          <CheckCircle2 size={13} color="#4ade80" strokeWidth={2.5} />
-          <Text style={styles.qualityText}>Image captured</Text>
-        </View>
+        {!imageError && (
+          <View style={styles.qualityPill}>
+            <CheckCircle2 size={13} color="#4ade80" strokeWidth={2.5} />
+            <Text style={styles.qualityText}>Image captured</Text>
+          </View>
+        )}
       </View>
 
       {/* Action panel */}
@@ -358,9 +361,10 @@ export default function ReviewScreen() {
 
         {/* Primary extract button */}
         <TouchableOpacity
-          style={styles.extractBtn}
+          style={[styles.extractBtn, imageError && styles.extractBtnDisabled]}
           onPress={handleExtract}
-          activeOpacity={0.88}
+          activeOpacity={imageError ? 1 : 0.88}
+          disabled={imageError}
         >
           <Sparkles size={20} color={Colors.white} strokeWidth={2} />
           <Text style={styles.extractBtnText}>Extract Bill Items</Text>
@@ -574,6 +578,9 @@ const styles = StyleSheet.create({
         shadowRadius: 8,
       },
     }),
+  },
+  extractBtnDisabled: {
+    opacity: 0.5,
   },
   extractBtnText: {
     fontSize: 16,

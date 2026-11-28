@@ -12,10 +12,11 @@ The backend never stores rupee floats internally.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -29,27 +30,31 @@ class CurrencyCode(str, Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Raw Gemini output schema
-# These mirror the JSON structure Gemini is asked to return.
-# They use Optional floats because Gemini works in rupees; the service
-# layer converts them to paise before building the API response.
+# Raw provider output schema
+# Monetary values remain in major currency units here; the service layer
+# converts them to integer paise before building the API response.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RawItemSchema(BaseModel):
     """One line item as returned by Gemini (amounts in rupees, may be null)."""
 
     name: str
-    qty: float = Field(default=1.0)
+    qty: float = Field(default=1.0, gt=0)
     unit_price: Optional[float] = None   # rupees
     item_total: Optional[float] = None   # rupees
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 
+    @field_validator("unit_price", "item_total", mode="before")
+    @classmethod
+    def _parse_amount(cls, value):
+        return parse_currency_amount(value)
 
-class RawGeminiOutput(BaseModel):
+
+class RawOCRBill(BaseModel):
     """
-    Full structured JSON that Gemini is instructed to return.
+    Provider-neutral structured bill output.
     All monetary values are in the detected currency (rupees for INR bills).
-    Unknown/unreadable fields must be null — Gemini must NOT invent values.
+    Unknown/unreadable fields must be null; providers must not invent values.
     """
 
     restaurant_name: Optional[str] = None
@@ -58,11 +63,47 @@ class RawGeminiOutput(BaseModel):
     gst_amount: Optional[float] = None         # printed GST / tax
     discount_amount: Optional[float] = None    # any discount line
     service_charge: Optional[float] = None     # service charge / tip on bill
+    other_charges: Optional[float] = None      # packaging, delivery, etc.
+    round_off: Optional[float] = None
     grand_total: Optional[float] = None        # printed grand total
     currency: str = "UNKNOWN"
     overall_confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     warnings: List[str] = Field(default_factory=list)
 
+    @field_validator(
+        "subtotal",
+        "gst_amount",
+        "discount_amount",
+        "service_charge",
+        "other_charges",
+        "round_off",
+        "grand_total",
+        mode="before",
+    )
+    @classmethod
+    def _parse_amounts(cls, value):
+        return parse_currency_amount(value)
+
+
+RawGeminiOutput = RawOCRBill
+
+
+def parse_currency_amount(value: object) -> Optional[float]:
+    """Parse numeric JSON amounts and common printed Indian currency formats."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        cleaned = re.sub(r"(?i)^(?:rs\.?|inr)\s*", "", cleaned)
+        cleaned = cleaned.replace(",", "")
+        for symbol in ("₹", "$", "€", "£"):
+            cleaned = cleaned.replace(symbol, "")
+        value = cleaned.strip()
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return amount if amount == amount and abs(amount) != float("inf") else None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API-level schemas (paise, used in the HTTP response)
@@ -73,22 +114,14 @@ class ExtractedItemSchema(BaseModel):
 
     id: str = Field(..., description="Unique identifier for this item")
     name: str = Field(..., min_length=1)
-    qty: int = Field(..., ge=1)
+    qty: float = Field(..., gt=0)
     unit_price_paise: int = Field(..., ge=0, description="Unit price in integer paise")
-    line_total_paise: int = Field(..., ge=0, description="qty × unit_price_paise")
+    line_total_paise: int = Field(..., ge=0, description="Printed or computed line total in paise")
+    unit_price_inferred: bool = Field(
+        default=False,
+        description="True when unit price was inferred from the printed line total.",
+    )
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
-
-    @field_validator("line_total_paise")
-    @classmethod
-    def _check_line_total(cls, v: int, info) -> int:
-        data = info.data
-        expected = data.get("qty", 1) * data.get("unit_price_paise", 0)
-        if expected != v:
-            raise ValueError(
-                f"line_total_paise ({v}) ≠ qty ({data.get('qty')}) "
-                f"× unit_price_paise ({data.get('unit_price_paise')})"
-            )
-        return v
 
 
 class ValidationWarning(BaseModel):
@@ -99,6 +132,12 @@ class ValidationWarning(BaseModel):
     expected_paise: Optional[int] = None
     actual_paise: Optional[int] = None
     difference_paise: Optional[int] = None
+
+
+class OCRTextRegion(BaseModel):
+    text: str
+    confidence: Optional[float] = None
+    bbox: List[List[int]] = Field(default_factory=list)
 
 
 class OCRExtractResponse(BaseModel):
@@ -126,6 +165,8 @@ class OCRExtractResponse(BaseModel):
     detected_gst_paise: Optional[int] = None
     detected_discount_paise: Optional[int] = None
     detected_service_charge_paise: Optional[int] = None
+    detected_other_charges_paise: Optional[int] = None
+    detected_round_off_paise: Optional[int] = None
     detected_grand_total_paise: Optional[int] = None
 
     # Computed amounts (from summing items, in paise)
@@ -137,7 +178,11 @@ class OCRExtractResponse(BaseModel):
     has_mismatch: bool = Field(default=False)
 
     # Overall quality
+    ocr_provider: str = "gemini"
+    ocr_text: Optional[str] = None
+    ocr_regions: List[OCRTextRegion] = Field(default_factory=list)
     overall_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    provider_warnings: List[str] = Field(default_factory=list)
     gemini_warnings: List[str] = Field(default_factory=list)
 
     # Human-readable summary

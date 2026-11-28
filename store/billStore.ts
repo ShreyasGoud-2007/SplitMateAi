@@ -20,6 +20,9 @@ interface BillStoreContextValue {
   setBill: (bill: ExtractedBill) => void;
   /** Get the active bill (called from results.tsx on mount). */
   getBill: () => ExtractedBill | null;
+  /** Hand off a selected image URI between scan routes without URL decoding. */
+  setPendingImageUri: (uri: string | null) => void;
+  getPendingImageUri: () => string | null;
   /** Store the active group bill-splitting session. */
   setSplitSession: (session: SplitSession) => void;
   /** Get the active group bill-splitting session. */
@@ -35,6 +38,7 @@ const BillStoreContext = createContext<BillStoreContextValue | null>(null);
 export function BillStoreProvider({ children }: { children: React.ReactNode }) {
   // useRef so mutations don't cause re-renders of the provider tree
   const billRef = useRef<ExtractedBill | null>(null);
+  const pendingImageUriRef = useRef<string | null>(null);
   const splitSessionRef = useRef<SplitSession | null>(null);
   const itemAssignmentsRef = useRef<ItemAssignments>({});
 
@@ -47,6 +51,10 @@ export function BillStoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const getBill = useCallback(() => billRef.current, []);
+  const setPendingImageUri = useCallback((uri: string | null) => {
+    pendingImageUriRef.current = uri;
+  }, []);
+  const getPendingImageUri = useCallback(() => pendingImageUriRef.current, []);
   const setSplitSession = useCallback((session: SplitSession) => {
     splitSessionRef.current = session;
   }, []);
@@ -62,6 +70,8 @@ export function BillStoreProvider({ children }: { children: React.ReactNode }) {
       value: {
         setBill,
         getBill,
+        setPendingImageUri,
+        getPendingImageUri,
         setSplitSession,
         getSplitSession,
         setItemAssignments,

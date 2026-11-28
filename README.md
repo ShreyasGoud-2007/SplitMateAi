@@ -56,8 +56,10 @@ Mobile Application (React Native + Expo)
 Backend API (FastAPI)
         |
         | AI Processing
-        v
-Google Gemini API
+        +----------------------+
+        |                      |
+        v                      v
+Google Gemini API      PaddleOCR (CPU)
         |
         v
 Bill Data Extraction & Processing
@@ -164,10 +166,14 @@ pip install -r requirements.txt
 Create a `.env` file inside the `backend` folder.
 
 ```env
+OCR_PROVIDER=gemini
+GEMINI_MODEL=gemini-3.6-flash
 GEMINI_API_KEY=your_api_key_here
 ```
 
-Add other backend environment variables if required by the project configuration.
+`OCR_PROVIDER` accepts `gemini` or `paddleocr` and defaults to `gemini`. Gemini
+remains the default provider; selecting PaddleOCR does not silently fall back to
+Gemini. PaddleOCR does not require a Gemini API key.
 
 **Do not commit API keys or environment files to GitHub.**
 
@@ -190,6 +196,48 @@ API documentation:
 ```text
 http://localhost:8000/docs
 ```
+
+### Optional: PaddleOCR on Windows (CPU)
+
+PaddleOCR runs only in the Python backend. This setup uses PaddlePaddle's CPU
+wheel and the lightweight PP-OCRv5 mobile detector/recognizer; no CUDA or GPU
+installation is needed. Use a 64-bit Python 3.13 environment.
+
+See the [official PaddleOCR installation guide](https://www.paddleocr.ai/latest/en/version3.x/installation.html)
+and [OCR model reference](https://www.paddleocr.ai/latest/en/version3.x/pipeline_usage/OCR.html)
+for supported inference engines and model details.
+
+From `backend` in PowerShell, activate the existing virtual environment (or
+create one as shown above), then install the CPU runtime and PaddleOCR:
+
+```powershell
+python -m pip install --upgrade pip
+python -m pip install paddlepaddle==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -m pip install -r requirements-paddleocr.txt
+```
+
+Set the provider in `backend/.env` and restart the backend:
+
+```env
+OCR_PROVIDER=paddleocr
+```
+
+The two mobile model files are downloaded and cached by PaddleOCR on its first
+use. The first request therefore needs internet access. OCR regions, recognized
+text, confidence values, and parser warnings are included in the API response.
+Uncertain or missing fields are left unfilled or explicitly warned about for
+manual review.
+
+Run the PaddleOCR parsing/provider tests without downloading models:
+
+```powershell
+python -m pytest tests/test_paddleocr_service.py -q
+```
+
+To exercise actual CPU inference after installing the optional dependencies,
+start the backend with `OCR_PROVIDER=paddleocr` and submit a bill image through
+`http://localhost:8000/docs` (`POST /api/ocr/extract`). Gemini remains available
+by switching `OCR_PROVIDER` back to `gemini`.
 
 ### 7. Start the Mobile Application
 

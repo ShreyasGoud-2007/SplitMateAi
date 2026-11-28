@@ -1,5 +1,6 @@
 import LoadingOverlay from '@/components/LoadingOverlay';
 import { normalizeImageUri } from '@/utils/normalizeImageUri';
+import { useBillStore } from '@/store/billStore';
 import PermissionDenied from '@/components/PermissionDenied';
 import { Colors } from '@/constants/Colors';
 import * as ImagePicker from 'expo-image-picker';
@@ -28,6 +29,7 @@ type PermissionError = 'camera' | 'gallery' | null;
 
 export default function ScanScreen() {
   const router = useRouter();
+  const { setPendingImageUri } = useBillStore();
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState('');
   const [permissionError, setPermissionError] = useState<PermissionError>(null);
@@ -39,25 +41,21 @@ export default function ScanScreen() {
     mimeType: string,
     fileName: string,
   ) {
-    console.log('[Scan] Navigating to review');
-    console.log('[Scan] URI (first 80 chars):', uri.slice(0, 80));
-    console.log('[Scan] mimeType:', mimeType, '| fileName:', fileName);
+    setPendingImageUri(uri);
     router.push({
       pathname: '/scan/review',
-      params: { uri, mimeType, fileName },
+      params: { mimeType, fileName },
     });
   }
 
   // ── Camera ─────────────────────────────────────────────────────────────────
 
   async function handleTakePhoto() {
-    console.log('[Scan] --- Take Photo pressed ---');
     try {
       setLoading(true);
       setLoadingMessage('Requesting camera access…');
 
       const { status } = await ImagePicker.requestCameraPermissionsAsync();
-      console.log('[Scan] Camera permission status:', status);
 
       if (status !== ImagePicker.PermissionStatus.GRANTED) {
         setLoading(false);
@@ -66,7 +64,6 @@ export default function ScanScreen() {
       }
 
       setLoadingMessage('Opening camera…');
-      console.log('[Scan] Launching camera picker');
 
       const result = await ImagePicker.launchCameraAsync({
         mediaTypes: ['images'],
@@ -74,23 +71,16 @@ export default function ScanScreen() {
         allowsEditing: false,
       });
 
-      console.log('[Scan] Camera result canceled:', result.canceled);
-
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
         const mime = asset.mimeType ?? 'image/jpeg';
         const name = asset.fileName ?? 'bill.jpg';
-        console.log('[Scan] Selected asset URI (first 80):', asset.uri.slice(0, 80));
-        console.log('[Scan] mimeType:', mime, '| fileName:', name);
-        console.log('[Scan] Dimensions:', asset.width, 'x', asset.height, '| fileSize (bytes):', asset.fileSize ?? 'n/a');
-        // Normalise content:// -> file:// so Image and FormData work on Android
+        // Copy picker cache images into app-owned storage before navigation.
         const fileUri = await normalizeImageUri(asset.uri, mime);
-        console.log('[Scan] Normalised URI (first 80):', fileUri.slice(0, 80));
         setLoading(false);
         navigateToReview(fileUri, mime, name);
       } else {
         setLoading(false);
-        console.log('[Scan] Camera picker cancelled or no assets');
       }
     } catch (err) {
       setLoading(false);
@@ -105,13 +95,11 @@ export default function ScanScreen() {
   // ── Gallery ────────────────────────────────────────────────────────────────
 
   async function handleChooseFromGallery() {
-    console.log('[Scan] --- Choose from Gallery pressed ---');
     try {
       setLoading(true);
       setLoadingMessage('Requesting gallery access…');
 
       const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      console.log('[Scan] Gallery permission status:', status);
 
       if (status !== ImagePicker.PermissionStatus.GRANTED) {
         setLoading(false);
@@ -120,7 +108,6 @@ export default function ScanScreen() {
       }
 
       setLoadingMessage('Opening gallery…');
-      console.log('[Scan] Launching image library picker');
 
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
@@ -129,23 +116,16 @@ export default function ScanScreen() {
         selectionLimit: 1,
       });
 
-      console.log('[Scan] Gallery result canceled:', result.canceled);
-
       if (!result.canceled && result.assets.length > 0) {
         const asset = result.assets[0];
         const mime = asset.mimeType ?? 'image/jpeg';
         const name = asset.fileName ?? 'bill.jpg';
-        console.log('[Scan] Selected asset URI (first 80):', asset.uri.slice(0, 80));
-        console.log('[Scan] mimeType:', mime, '| fileName:', name);
-        console.log('[Scan] Dimensions:', asset.width, 'x', asset.height, '| fileSize (bytes):', asset.fileSize ?? 'n/a');
-        // Normalise content:// -> file:// so Image and FormData work on Android
+        // Copy picker cache images into app-owned storage before navigation.
         const fileUri = await normalizeImageUri(asset.uri, mime);
-        console.log('[Scan] Normalised URI (first 80):', fileUri.slice(0, 80));
         setLoading(false);
         navigateToReview(fileUri, mime, name);
       } else {
         setLoading(false);
-        console.log('[Scan] Gallery picker cancelled or no assets');
       }
     } catch (err) {
       setLoading(false);
